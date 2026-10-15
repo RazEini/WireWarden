@@ -114,7 +114,7 @@ if __name__ == "__main__":
     sample_clean = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
     sample_malicious = b"POST /login HTTP/1.1\r\nHost: example.com\r\n\r\nusername=admin' OR '1'='1"
 
-    print(f"=== NetGuard DPI Benchmark ({NUM_PACKETS:,} Packets | Averaged over {NUM_RUNS} runs) ===")
+    print(f"=== WireWarden DPI Benchmark ({NUM_PACKETS:,} Packets | Averaged over {NUM_RUNS} runs) ===")
 
     test_payloads = [
         sample_malicious if i % 10 == 0 else sample_clean

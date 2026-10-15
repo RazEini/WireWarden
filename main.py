@@ -113,7 +113,7 @@ def block_ip_firewall_async(ip: str):
             elif system == "windows":
                 subprocess.run([
                     "netsh", "advfirewall", "firewall", "add", "rule",
-                    f"name=NetGuard_Block_{ip}", "dir=in", "action=block",
+                    f"name=WireWarden_Block_{ip}", "dir=in", "action=block",
                     f"remoteip={ip}"
                 ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
@@ -149,7 +149,7 @@ def _looks_like_plaintext(payload: bytes, sample_size: int = 32, min_printable_r
 #
 # Mirrors the ctypes binding used in benchmark_dpi.py, but wired into the
 # live detection path here. If libdpi.so/.dll hasn't been compiled yet
-# (see c_src/Makefile), the engine degrades gracefully: NetGuard still runs
+# (see c_src/Makefile), the engine degrades gracefully: WireWarden still runs
 # with the Aho-Corasick engine alone and logs a note explaining why.
 # ---------------------------------------------------------------------------
 

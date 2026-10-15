@@ -1,9 +1,9 @@
 apiVersion: 1
 
 providers:
-  - name: 'NetGuard Dashboards'
+  - name: 'WireWarden Dashboards'
     orgId: 1
-    folder: 'NetGuard Security'
+    folder: 'WireWarden Security'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10

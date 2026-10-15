@@ -345,7 +345,7 @@
   "style": "dark",
   "tags": [
     "security",
-    "netguard"
+    "wirewarden"
   ],
   "time": {
     "from": "now-6h",
@@ -353,6 +353,6 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "NetGuard Security Overview",
-  "uid": "netguard-security-overview"
+  "title": "WireWarden Security Overview",
+  "uid": "wirewarden-security-overview"
 }

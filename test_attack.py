@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetGuard NIDS - Safe Attack Simulator Script
+WireWarden NIDS - Safe Attack Simulator Script
 Simulates various attack patterns (DPI, Port Scanning, Stealth Scans, 
 DNS Tunneling, SYN Flood, Port 0) to validate NIDS detection rules 
 and observability pipelines safely.
@@ -135,7 +135,7 @@ def test_syn_flood() -> None:
 
 
 def main() -> None:
-    print("🕵️  NetGuard Attack Simulator Initializing...")
+    print("🕵️  WireWarden Attack Simulator Initializing...")
     print(f"🎯 Target IP set to: {TARGET_IP}")
     print("⚠️  Safe mode active: Sending synthetic packets only.\n")
 
