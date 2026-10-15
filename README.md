@@ -1,4 +1,4 @@
-<h1 align="center"> 🕵️ NetGuard – Hybrid Python/C NIDS & Observability Engine </h1>
+<h1 align="center"> 🕵️ WireWarden – Hybrid Python/C NIDS & Observability Engine </h1>
 
 <p align="center">
   A full end-to-end real-time <strong>Network Intrusion Detection & Prevention System (NIDS/NIPS)</strong>.
@@ -21,10 +21,10 @@
 
 ## 🔎 Overview & Architecture
 
-**NetGuard** provides a complete solution for monitoring, analyzing, and responding to network security events across OSI layers 3, 4, and 7.
+**WireWarden** provides a complete solution for monitoring, analyzing, and responding to network security events across OSI layers 3, 4, and 7.
 The architecture is built on a continuous Producer-Consumer pipeline that separates low-level packet capture, real-time threat analysis, and structured observability shipping.
 
-> **Architecture Highlight:** NetGuard runs a **dual-layer DPI pipeline** on non-encrypted traffic: an Aho-Corasick automaton for Layer-7 keyword signatures, and a native C Extension (`ctypes`) for injection-pattern detection. Encrypted payloads (e.g., port 443) are automatically bypassed to optimize CPU usage and eliminate false positives.
+> **Architecture Highlight:** WireWarden runs a **dual-layer DPI pipeline** on non-encrypted traffic: an Aho-Corasick automaton for Layer-7 keyword signatures, and a native C Extension (`ctypes`) for injection-pattern detection. Encrypted payloads (e.g., port 443) are automatically bypassed to optimize CPU usage and eliminate false positives.
 
 ```mermaid
 flowchart LR
@@ -57,20 +57,20 @@ flowchart LR
 
 ## 📊 Dashboard Preview
 
-Live view of the **NetGuard Security Overview** Grafana dashboard, provisioned automatically from code.
+Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned automatically from code.
 
 <p align="center">
-  <img src="assets/dashboard_overview.png" alt="NetGuard Live Security Log Stream & Events Distribution" width="95%">
+  <img src="assets/dashboard_overview.png" alt="WireWarden Live Security Log Stream & Events Distribution" width="95%">
   <br><em>Live JSON log stream with DNS query events, alongside real-time Security Events Distribution and Threat Timeline panels.</em>
 </p>
 
 <p align="center">
-  <img src="assets/dashboard_threat_detection.png" alt="NetGuard DoS Detection & DNS Tunneling Alert" width="95%">
+  <img src="assets/dashboard_threat_detection.png" alt="WireWarden DoS Detection & DNS Tunneling Alert" width="95%">
   <br><em>Active Defense in action — a DoS/SYN Flood attack triggers automatic IP isolation, alongside a DNS Tunneling detection alert (Shannon entropy-based).</em>
 </p>
 
 <p align="center">
-  <img src="assets/dashboard_analytics.png" alt="NetGuard Security Events Breakdown & Top Suspicious Source IPs" width="95%">
+  <img src="assets/dashboard_analytics.png" alt="WireWarden Security Events Breakdown & Top Suspicious Source IPs" width="95%">
   <br><em>Full event-type breakdown (Port Scans, Stealth Scans, DPI Alerts, DoS Attacks) with Top Suspicious Source IPs and Total Security Alerts panels.</em>
 </p>
 
@@ -88,7 +88,7 @@ Live view of the **NetGuard Security Overview** Grafana dashboard, provisioned a
 
 ## 🔬 DPI Engines: Live Detection vs. Throughput Benchmark
 
-NetGuard runs **two DPI engines together** in the live pipeline (`main.py`), each covering a different signature class, plus a separate standalone script for measuring the C engine's raw throughput in isolation:
+WireWarden runs **two DPI engines together** in the live pipeline (`main.py`), each covering a different signature class, plus a separate standalone script for measuring the C engine's raw throughput in isolation:
 
 | | **Live: Aho-Corasick (`_check_dpi_keywords`)** | **Live: Native C (`_check_dpi_native`)** | **Standalone: `benchmark_dpi.py`** |
 | :--- | :--- | :--- | :--- |
@@ -96,9 +96,9 @@ NetGuard runs **two DPI engines together** in the live pipeline (`main.py`), eac
 | Where it runs | Inside `NetworkGuardian._check_dpi`, on every captured packet | Inside `NetworkGuardian._check_dpi`, on every captured packet | Standalone script only — not imported by `main.py` |
 | Signature set | `admin`, `password`, `etc/passwd`, `select * from` | `' OR '1'='1`, `UNION SELECT`, `<script>`, `../../`, `etc/passwd`, `cmd.exe`, `; whoami` | Same as the live C engine (fixed in `dpi.c`) |
 | Purpose | Real-time keyword/credential-leak alerting | Real-time injection-pattern alerting (SQLi, XSS, path traversal, cmd injection) | Measuring native-C vs. pure-Python throughput on synthetic payloads |
-| Required? | Recommended (`pip install pyahocorasick`); falls back to pure Python if missing | Optional — compile with `make -C c_src`; NetGuard runs on Aho-Corasick alone if the shared library isn't present | N/A — dev/benchmarking tool only |
+| Required? | Recommended (`pip install pyahocorasick`); falls back to pure Python if missing | Optional — compile with `make -C c_src`; WireWarden runs on Aho-Corasick alone if the shared library isn't present | N/A — dev/benchmarking tool only |
 
-**In short:** the ~8x acceleration number below is a controlled, isolated measurement of the C engine's throughput on synthetic payloads — it describes the engine's capability, not a claim about end-to-end NIDS throughput (which also includes Scapy capture, queueing, and the Aho-Corasick pass). Build `libdpi` (`make -C c_src`) before running `main.py` to get the C-accelerated injection-signature detection live; without it, NetGuard still runs correctly on Aho-Corasick alone.
+**In short:** the ~8x acceleration number below is a controlled, isolated measurement of the C engine's throughput on synthetic payloads — it describes the engine's capability, not a claim about end-to-end NIDS throughput (which also includes Scapy capture, queueing, and the Aho-Corasick pass). Build `libdpi` (`make -C c_src`) before running `main.py` to get the C-accelerated injection-signature detection live; without it, WireWarden still runs correctly on Aho-Corasick alone.
 
 ---
 
@@ -127,7 +127,7 @@ NetGuard runs **two DPI engines together** in the live pipeline (`main.py`), eac
 ## 📂 Project Structure
 
 ```text
-NetGuard/
+WireWarden/
 ├── assets/                          # Static Documentation Assets (Dashboard Screenshots)
 │   ├── dashboard_overview.png
 │   ├── dashboard_threat_detection.png
@@ -137,7 +137,7 @@ NetGuard/
 │   └── Makefile                    # C Compilation Setup
 ├── grafana/
 │   ├── dashboards/                 # Standard JSON Dashboard (Git Version-Controlled)
-│   │   └── dashboard-NetGuard Security Overview.json
+│   │   └── dashboard-WireWarden Security Overview.json
 │   └── provisioning/                # Grafana Automated Provisioning Configs
 │       ├── dashboards/
 │       │   └── dashboards.yml
@@ -168,7 +168,7 @@ NetGuard/
 | ⚡ **Active Defense** | Dynamic IP Isolation & OS Firewall | ✅ | Active mitigation mechanism that dynamically injects OS firewall rules (`netsh` / `iptables`) to block malicious hosts upon threshold breach. | Non-blocking async execution, O(1) blacklist check |
 | 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 payload scanning: an **Aho-Corasick automaton** for keyword signatures, plus a **Native C Extension** (loaded live via `ctypes`) for bounds-checked injection-pattern signatures. Falls back to Aho-Corasick alone if the C library isn't compiled. | O(N+M) string matching; native C path measured at ~8x throughput vs. pure Python in isolation |
 | ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, `threading.Lock` primitives, and a dedicated background Garbage Collector thread to prevent memory leaks. | Bounded queue, backpressure-safe |
-| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "NetGuard Security Overview" dashboard in standard JSON format, automatically loaded on container startup via Provisioning files. | Instant provisioning on boot |
+| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON format, automatically loaded on container startup via Provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for collection by Promtail. | Low-overhead async writes |
 | 🧪 **Testing** | Traffic Attack Simulator | ✅ | Simulation script (`test_attack.py`) that generates synthetic attack traffic to validate detection mechanisms. | Configurable synthetic load |
 
@@ -178,19 +178,19 @@ NetGuard/
 
 - **Python & Scapy** — Raw-socket-level packet capture, protocol parsing, and deep payload-level inspection (DPI).
 - **Aho-Corasick DPI (live)** — Multi-pattern automaton (`pyahocorasick`) used inside `main.py` for real-time keyword/signature matching against packet payloads, with a pure-Python substring fallback when the library is unavailable.
-- **Native C Extension (ctypes, live)** — Batch-safe, memory-bounds-checked C DPI engine loaded via `ctypes` in `NetworkGuardian.__init__` and called on every packet's payload in `_check_dpi_native` alongside the Aho-Corasick pass, delivering **~8x** (7.94x measured) throughput over pure Python for its signature set. The same shared library is also loaded independently by `benchmark_dpi.py` for isolated throughput measurement. Requires `make -C c_src` first; NetGuard degrades gracefully to Aho-Corasick-only if the compiled library isn't present.
+- **Native C Extension (ctypes, live)** — Batch-safe, memory-bounds-checked C DPI engine loaded via `ctypes` in `NetworkGuardian.__init__` and called on every packet's payload in `_check_dpi_native` alongside the Aho-Corasick pass, delivering **~8x** (7.94x measured) throughput over pure Python for its signature set. The same shared library is also loaded independently by `benchmark_dpi.py` for isolated throughput measurement. Requires `make -C c_src` first; WireWarden degrades gracefully to Aho-Corasick-only if the compiled library isn't present.
 - **Producer-Consumer Architecture** — Full separation between packet capture and analysis via `queue.Queue(maxsize=20000)`, preventing packet loss under load.
 - **Thread-Safety & Active Defense** — Whitelist/Blacklist state management guarded by `threading.Lock` to prevent data races, integrated with background dynamic OS Firewall rule injection (`netsh` / `iptables`).
 - **Background Garbage Collector** — A dedicated background thread that cleans up stale data structures (Sliding Window History & Blacklist) from memory every 30 seconds, synchronously and thread-safely, ensuring zero memory leaks from dormant IP addresses.
 - **Promtail & Grafana Loki** — Shipping of structured JSON logs from the local logs directory and indexing them in Loki.
-- **Dashboards as Code (IaC)** — The "NetGuard Security Overview" dashboard is version-controlled in Git under `grafana/dashboards/`, automatically loaded into Grafana on container startup.
+- **Dashboards as Code (IaC)** — The "WireWarden Security Overview" dashboard is version-controlled in Git under `grafana/dashboards/`, automatically loaded into Grafana on container startup.
 - **Docker Compose Stack** — One-click deployment of the entire observability infrastructure.
 
 ---
 
 ### 🧬 Algorithmic Detection: Shannon Entropy for DNS Tunneling
 
-NetGuard identifies covert communications and data exfiltration over DNS by analyzing the randomness (entropy) of domain query strings. 
+WireWarden identifies covert communications and data exfiltration over DNS by analyzing the randomness (entropy) of domain query strings. 
 
 Standard domain names exhibit predictable natural-language patterns, whereas encrypted/encoded data streams (e.g., Base64/Hex DNS Tunneling) produce significantly higher entropy scores.
 
@@ -206,7 +206,7 @@ Standard domain names exhibit predictable natural-language patterns, whereas enc
 - **Git** — Required to clone the repository.
 - **Docker & Docker Compose** — For running Loki, Promtail, and Grafana.
 - **Python 3.10+** — Required for running the NIDS engine and test suite.
-- **GCC / Make** — Required to compile the native C DPI engine shared object (`libdpi.so` on Linux, `libdpi.dylib` on macOS, `libdpi.dll` on Windows). Recommended before running `main.py`, since it's now loaded live for injection-signature detection; also used to run `benchmark_dpi.py`. NetGuard still runs correctly on Aho-Corasick alone if you skip this.
+- **GCC / Make** — Required to compile the native C DPI engine shared object (`libdpi.so` on Linux, `libdpi.dylib` on macOS, `libdpi.dll` on Windows). Recommended before running `main.py`, since it's now loaded live for injection-signature detection; also used to run `benchmark_dpi.py`. WireWarden still runs correctly on Aho-Corasick alone if you skip this.
 - **`pyahocorasick`** — Optional but recommended for the live DPI engine's full performance; a pure-Python fallback is used automatically if it's not installed.
 - **Administrator / Root Privileges** — Required to capture raw socket traffic via Scapy and inject OS Firewall blocking rules (or use the least-privilege `setcap` option below on Linux).
 - **Npcap (Windows only)** — Required for Scapy to capture raw packets on Windows network adapters.
@@ -233,8 +233,8 @@ Standard domain names exhibit predictable natural-language patterns, whereas enc
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/RazEini/NetGuard.git
-cd NetGuard
+git clone https://github.com/RazEini/WireWarden.git
+cd WireWarden
 
 # 2. Environment Setup
 cp .env.example .env  # Set your Grafana password in .env
@@ -251,7 +251,7 @@ pip install -r requirements.txt
 
 # 5. Compile the Native C DPI Engine (recommended)
 # main.py auto-detects and loads this at startup for live injection-signature
-# detection; if you skip this step NetGuard still runs fine on Aho-Corasick alone.
+# detection; if you skip this step WireWarden still runs fine on Aho-Corasick alone.
 make -C c_src                                                # Linux / macOS
 gcc -shared -O3 -march=native -o libdpi.dll c_src/dpi.c      # Windows — requires MinGW/MSYS2 installed
 
