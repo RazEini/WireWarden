@@ -310,3 +310,28 @@ def test_unsupported_os_never_pretends_to_block(monkeypatch):
     fwm = FirewallManager(logging.getLogger("other"), runner=runner)
     assert fwm.block("203.0.113.9", blocking=True) is False
     assert runner.calls == [] and fwm.rules == set()
+
+
+# ---- Lab mode: attacking another device (e.g. the home router) -------------
+ROUTER = "192.168.1.1"
+
+
+def run_attack_against_router(g):
+    """What test_attack.py sends when its target is the router: spoofed sources, dst = router."""
+    for i in range(g.DOS_THRESHOLD + 50):
+        g.analyze_packet(IP(src="203.0.113.50", dst=ROUTER) / TCP(sport=1000 + i, dport=80, flags="S"))
+    for port in range(1000, 1061):
+        g.analyze_packet(IP(src="203.0.113.51", dst=ROUTER) / TCP(sport=4000, dport=port, flags="S"))
+
+
+def test_attack_aimed_at_another_device_is_ignored_by_default(guardian, fw):
+    run_attack_against_router(guardian)
+    assert "DOS_ATTACK" not in types(guardian) and "PORT_SCAN" not in types(guardian)
+    assert fw.blocked == []
+
+
+def test_include_outbound_lab_mode_detects_attack_aimed_at_router(tmp_path, fw, libdpi):
+    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=fw, include_outbound=True)
+    run_attack_against_router(g)
+    assert "DOS_ATTACK" in types(g) and "PORT_SCAN" in types(g)
+    assert fw.blocked == ["203.0.113.50"]

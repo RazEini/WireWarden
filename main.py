@@ -327,7 +327,8 @@ class NetworkGuardian:
 
     def __init__(self, dos_threshold=500, scan_threshold=50, time_window_sec=10,
                  cleanup_interval_sec=30, block_duration_sec=300, queue_size=20000,
-                 whitelist=(), local_ips=None, dry_run=False, log_dir="logs", firewall=None):
+                 whitelist=(), local_ips=None, dry_run=False, log_dir="logs", firewall=None,
+                 include_outbound=False):
         self.logger = setup_logger(log_dir)
         self.packet_queue = Queue(maxsize=queue_size)
         self.stop_event = threading.Event()
@@ -356,6 +357,10 @@ class NetworkGuardian:
 
         # Direction + whitelist. Without a known local address we cannot tell
         # inbound from outbound, so every packet is treated as inbound.
+        # include_outbound=True is a LAB mode: DoS/port-scan windows also count packets this
+        # host sends (e.g. aiming test_attack.py at your router). Off by default so normal
+        # outbound traffic and replies can never look like an attack.
+        self.include_outbound = include_outbound
         self.local_ips = set(local_ips) if local_ips is not None else discover_local_ips()
         nets = [ipaddress.ip_network("127.0.0.0/8")]
         nets += [ipaddress.ip_network(ip, strict=False) for ip in self.local_ips]
@@ -388,7 +393,7 @@ class NetworkGuardian:
         return any(addr in net for net in self.whitelist_nets)
 
     def _is_inbound(self, dst_ip: str) -> bool:
-        return not self.local_ips or dst_ip in self.local_ips
+        return self.include_outbound or not self.local_ips or dst_ip in self.local_ips
 
     def _is_blacklisted(self, src_ip, now) -> bool:
         # Lock-free read (single dict.get). Expired entries are removed by the cleanup thread.
@@ -625,6 +630,8 @@ def parse_args(argv=None):
     p.add_argument("--iface", default=None, help="interface to sniff (default: scapy default)")
     p.add_argument("--whitelist", default="", help="comma-separated IPs/CIDRs that must never be blocked")
     p.add_argument("--dry-run", action="store_true", help="detect and log, but never touch the firewall")
+    p.add_argument("--include-outbound", action="store_true",
+                   help="LAB MODE: also count traffic this host sends (use when test_attack.py targets another device, e.g. your router)")
     p.add_argument("--dos-threshold", type=int, default=500)
     p.add_argument("--scan-threshold", type=int, default=50)
     p.add_argument("--block-seconds", type=int, default=300)
@@ -637,5 +644,5 @@ if __name__ == "__main__":
         dos_threshold=args.dos_threshold, scan_threshold=args.scan_threshold,
         block_duration_sec=args.block_seconds,
         whitelist=[w.strip() for w in args.whitelist.split(",") if w.strip()],
-        dry_run=args.dry_run)
+        dry_run=args.dry_run, include_outbound=args.include_outbound)
     guardian.start(num_workers=args.workers, iface=args.iface)

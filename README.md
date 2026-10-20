@@ -182,7 +182,7 @@ WireWarden/
 | ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, a shared `threading.Lock`, monotonic-time windows, and a dedicated GC thread. | Bounded queue, backpressure with counted drops |
 | 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
-| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 44 pytest tests (detection, native engine, firewall for iptables and netsh), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
+| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 46 pytest tests (detection, native engine, firewall for iptables and netsh, lab mode), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
 
 ---
 
@@ -301,9 +301,21 @@ python main.py --whitelist 10.0.0.0/24
 | :--- | :--- | :--- |
 | `--dry-run` | off | Log what *would* be blocked; never run firewall commands |
 | `--whitelist A,B/CIDR` | – | Extra never-block addresses (this host, gateway and loopback are automatic) |
+| `--include-outbound` | off | **Lab mode:** also count traffic this host *sends*. Needed when `test_attack.py` targets another device such as your router (see below) |
 | `--block-seconds` | 300 | How long a DoS source stays blocked |
 | `--dos-threshold` / `--scan-threshold` | 500 / 50 | Events per 10-second window |
 | `--workers` / `--iface` | 4 / default | Worker threads / interface to sniff |
+
+### Which traffic counts? (inbound vs. outbound)
+
+DoS and port-scan windows count **inbound** traffic only, meaning packets whose destination is one of this machine's own addresses. Your own outbound traffic and replies must never look like an attack. DPI, stealth-scan and DNS-tunneling detection look at traffic in both directions.
+
+That matters for the simulator. `test_attack.py` run **without an argument** targets your own IP, so every detector fires, including the red DoS block. If you point it at **another device** (e.g. your router), those packets leave your machine, so the DoS and port-scan alerts are skipped on purpose. To demo against another device, add the lab flag:
+
+```bash
+python main.py --include-outbound --dry-run     # --dry-run: alerts only, no firewall rule
+python test_attack.py 192.168.1.1               # router / other device
+```
 
 ### 7. Run Attack Simulator (in a separate terminal)
 
@@ -324,7 +336,7 @@ python test_attack.py <TARGET_IP>
 ```bash
 pip install -r requirements-dev.txt
 make -C c_src
-python -m pytest tests -v        # 44 tests: detection logic, DPI engines, firewall manager (iptables + netsh)
+python -m pytest tests -v        # 46 tests: detection logic, DPI engines, firewall manager (iptables + netsh), lab mode
 make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
