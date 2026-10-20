@@ -1,18 +1,24 @@
+"""WireWarden - hybrid Python/C network intrusion detection & prevention engine."""
+import argparse
 import ctypes
-import math
+import ipaddress
 import json
 import logging
+import math
 import os
 import platform
 import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from collections import OrderedDict, defaultdict, deque
+from datetime import datetime
 from pathlib import Path
-from queue import Queue, Empty
-from scapy.all import sniff, IP, TCP, UDP, Raw, DNSQR
+from queue import Empty, Full, Queue
+from typing import Optional
+from urllib.parse import unquote_to_bytes
+
+from scapy.all import DNS, DNSQR, IP, TCP, UDP, Raw, sniff
 
 try:
     import colorama
@@ -27,12 +33,13 @@ except ImportError:
     HAS_AHOCORASICK = False
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 class Colors:
     RED = "\033[91m"
-    GREEN = "\033[92m"
     YELLOW = "\033[93m"
     CYAN = "\033[96m"
-    MAGENTA = "\033[95m"
     RESET = "\033[0m"
 
 
@@ -41,13 +48,12 @@ class ColoredConsoleFormatter(logging.Formatter):
         logging.WARNING: Colors.YELLOW,
         logging.ERROR: Colors.RED,
         logging.CRITICAL: Colors.RED,
-        logging.INFO: Colors.CYAN
+        logging.INFO: Colors.CYAN,
     }
 
     def format(self, record):
         color = self.COLOR_MAP.get(record.levelno, Colors.RESET)
-        message = super().format(record)
-        return f"{color}{message}{Colors.RESET}"
+        return f"{color}{super().format(record)}{Colors.RESET}"
 
 
 class JsonFileFormatter(logging.Formatter):
@@ -56,30 +62,26 @@ class JsonFileFormatter(logging.Formatter):
             "timestamp": datetime.fromtimestamp(record.created).astimezone().isoformat(),
             "level": record.levelname,
             "message": str(record.getMessage()),
-            "logger": record.name
+            "logger": record.name,
         }
-
-        if hasattr(record, 'src_ip'):
-            log_record['src_ip'] = str(record.src_ip)
-        if hasattr(record, 'event_type'):
-            log_record['event_type'] = str(record.event_type)
-        if hasattr(record, 'details'):
-            log_record['details'] = str(record.details)
-
+        for field in ("src_ip", "event_type", "details"):
+            if hasattr(record, field):
+                log_record[field] = str(getattr(record, field))
         return json.dumps(log_record, ensure_ascii=False)
 
 
-def setup_logger():
+def setup_logger(log_dir: str = "logs") -> logging.Logger:
     logger = logging.getLogger("NetworkGuardian")
+    if logger.handlers:  # never stack duplicate handlers on repeated construction
+        return logger
+
     logger.setLevel(logging.INFO)
     logger.propagate = False
-
-    os.makedirs("logs", exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     ch = logging.StreamHandler()
-    ch.setFormatter(ColoredConsoleFormatter('%(asctime)s [%(levelname)s] %(message)s'))
-
-    fh = logging.FileHandler(os.path.join("logs", "network_security.json"), encoding="utf-8")
+    ch.setFormatter(ColoredConsoleFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh = logging.FileHandler(os.path.join(log_dir, "network_security.json"), encoding="utf-8")
     fh.setFormatter(JsonFileFormatter())
 
     logger.addHandler(ch)
@@ -87,56 +89,145 @@ def setup_logger():
     return logger
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def calculate_entropy(text: str) -> float:
-    """Calculates Shannon Entropy of a string."""
+    """Shannon entropy (bits/char) of a string."""
     if not text:
         return 0.0
-    text_len = len(text)
-    frequencies = defaultdict(int)
-    for char in text:
-        frequencies[char] += 1
-
-    entropy = 0.0
-    for count in frequencies.values():
-        p = count / text_len
-        entropy -= p * math.log2(p)
-    return entropy
+    n = len(text)
+    freq = defaultdict(int)
+    for ch in text:
+        freq[ch] += 1
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
 
-def block_ip_firewall_async(ip: str):
-    """Executes OS Firewall block in a background thread to avoid blocking worker queue."""
-    def _block():
+def discover_local_ips() -> set:
+    """Best-effort set of this machine's IPv4 addresses (used for direction + whitelist)."""
+    ips = {"127.0.0.1"}
+    try:
+        from scapy.all import get_if_addr, get_if_list
+        for iface in get_if_list():
+            try:
+                ips.add(get_if_addr(iface))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    ips.discard("0.0.0.0")
+    return ips
+
+
+def discover_default_gateway() -> Optional[str]:
+    try:
+        from scapy.all import conf
+        gw = conf.route.route("0.0.0.0")[2]
+        return gw if gw and gw != "0.0.0.0" else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Firewall (active response)
+# ---------------------------------------------------------------------------
+class FirewallManager:
+    """Adds AND removes OS firewall rules, and reports what actually happened.
+
+    Every rule this class adds is tracked, so expired blocks are removed and
+    unblock_all() restores the firewall on shutdown.
+    """
+
+    def __init__(self, logger: logging.Logger, dry_run: bool = False, runner=subprocess.run):
+        self.logger = logger
+        self.dry_run = dry_run
+        self._runner = runner
+        self._lock = threading.Lock()
+        self.rules = set()
+
+    def _commands(self, action: str, ip: str):
         system = platform.system().lower()
+        if system == "linux":
+            if action == "block":
+                return [["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]], \
+                       ["iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP"]
+            return None, ["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"]
+        if system == "windows":
+            name = f"name=WireWarden_Block_{ip}"
+            if action == "block":
+                return None, ["netsh", "advfirewall", "firewall", "add", "rule", name,
+                              "dir=in", "action=block", f"remoteip={ip}"]
+            return None, ["netsh", "advfirewall", "firewall", "delete", "rule", name]
+        return None, None
+
+    def _run(self, cmd) -> tuple:
         try:
-            if system == "linux":
-                subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif system == "windows":
-                subprocess.run([
-                    "netsh", "advfirewall", "firewall", "add", "rule",
-                    f"name=WireWarden_Block_{ip}", "dir=in", "action=block",
-                    f"remoteip={ip}"
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+            res = self._runner(cmd, capture_output=True, text=True, timeout=10)
+            return res.returncode == 0, (res.stderr or "").strip()
+        except FileNotFoundError:
+            return False, f"{cmd[0]} not found"
+        except PermissionError:
+            return False, "permission denied (run as root/Administrator)"
+        except Exception as e:  # timeout etc.
+            return False, str(e)
 
-    threading.Thread(target=_block, daemon=True).start()
+    def _block_now(self, ip: str) -> bool:
+        if self.dry_run:
+            self.logger.warning(f"[FIREWALL][DRY-RUN] would block {ip}",
+                                extra={"src_ip": ip, "event_type": "FIREWALL_DRY_RUN", "details": "block"})
+            return False
+        check, add = self._commands("block", ip)
+        if add is None:
+            self.logger.error(f"[FIREWALL] unsupported OS '{platform.system()}', cannot block {ip}")
+            return False
+        if check and self._run(check[0])[0]:  # rule already present
+            with self._lock:
+                self.rules.add(ip)
+            return True
+        ok, err = self._run(add)
+        if ok:
+            with self._lock:
+                self.rules.add(ip)
+            self.logger.warning(f"[FIREWALL] rule applied: {ip} blocked",
+                                extra={"src_ip": ip, "event_type": "FIREWALL_BLOCK", "details": "applied"})
+        else:
+            self.logger.error(f"[FIREWALL] FAILED to block {ip}: {err}",
+                              extra={"src_ip": ip, "event_type": "FIREWALL_ERROR", "details": err})
+        return ok
+
+    def block(self, ip: str, blocking: bool = False):
+        if blocking:
+            return self._block_now(ip)
+        threading.Thread(target=self._block_now, args=(ip,), daemon=True, name="FirewallBlock").start()
+
+    def unblock(self, ip: str) -> bool:
+        with self._lock:
+            if ip not in self.rules:
+                return False
+            self.rules.discard(ip)
+        _, delete = self._commands("unblock", ip)
+        if delete is None:
+            return False
+        ok, err = self._run(delete)
+        level = logging.WARNING if ok else logging.ERROR
+        self.logger.log(level, f"[FIREWALL] rule {'removed' if ok else 'removal FAILED'} for {ip}" + ("" if ok else f": {err}"),
+                        extra={"src_ip": ip, "event_type": "FIREWALL_UNBLOCK", "details": "removed" if ok else err})
+        return ok
+
+    def unblock_all(self):
+        with self._lock:
+            pending = list(self.rules)
+        for ip in pending:
+            self.unblock(ip)
 
 
 # ---------------------------------------------------------------------------
-# DPI eligibility filtering
-#
-# Substring-based DPI (both Aho-Corasick and the native C engine) is only
-# meaningful on plaintext payloads. Running it against encrypted traffic
-# (TLS, SSH, etc.) wastes CPU and — worse — can produce false positives,
-# since high-entropy encrypted bytes can coincidentally match a short
-# signature. We filter on two cheap heuristics before calling either engine:
-#   1. Skip well-known encrypted/binary ports.
-#   2. Skip payloads that don't look like mostly-printable ASCII text.
+# DPI engines
 # ---------------------------------------------------------------------------
-COMMON_ENCRYPTED_PORTS = {443, 8443, 465, 993, 995, 636, 22, 3389}
-
-
 def _looks_like_plaintext(payload: bytes, sample_size: int = 32, min_printable_ratio: float = 0.85) -> bool:
+    """Cheap filter: substring DPI on encrypted/binary bytes wastes CPU and
+    risks chance matches. Decided by content, NOT by port, so plaintext
+    attacks on 443/8443/etc. are still inspected."""
     if not payload:
         return False
     sample = payload[:sample_size]
@@ -144,246 +235,293 @@ def _looks_like_plaintext(payload: bytes, sample_size: int = 32, min_printable_r
     return (printable / len(sample)) >= min_printable_ratio
 
 
-# ---------------------------------------------------------------------------
-# Native C DPI Engine (optional, loaded lazily)
-#
-# Mirrors the ctypes binding used in benchmark_dpi.py, but wired into the
-# live detection path here. If libdpi.so/.dll hasn't been compiled yet
-# (see c_src/Makefile), the engine degrades gracefully: WireWarden still runs
-# with the Aho-Corasick engine alone and logs a note explaining why.
-# ---------------------------------------------------------------------------
-
-# Must stay in sync with the SIGNATURES array in c_src/dpi.c — used only to
-# turn the matched index back into a human-readable name for logging.
-NATIVE_SIGNATURE_NAMES = [
-    "' OR '1'='1",
-    "UNION SELECT",
-    "<script>",
-    "../../",
-    "etc/passwd",
-    "cmd.exe",
-    "; whoami",
-]
-
-
 def _get_lib_filename() -> str:
     if sys.platform == "win32":
         return "libdpi.dll"
-    elif sys.platform == "darwin":
+    if sys.platform == "darwin":
         return "libdpi.dylib"
-    else:
-        return "libdpi.so"
+    return "libdpi.so"
 
 
-def _load_c_dpi_engine(logger: logging.Logger):
-    base_dir = Path(__file__).parent.resolve()
-    lib_filename = _get_lib_filename()
-    lib_path = base_dir / lib_filename
+class NativeSignatureEngine:
+    """ctypes wrapper around libdpi. Signature names come from the C library itself."""
 
-    if not lib_path.exists():
-        logger.info(
-            f"[+] Note: '{lib_filename}' not found. Native C DPI engine disabled "
-            f"(run 'make -C c_src' to build it). Falling back to Aho-Corasick only."
-        )
-        return None
+    def __init__(self, logger: logging.Logger, lib_path: Optional[Path] = None):
+        self.available = False
+        self.names = []
+        self.max_len = 0
+        lib_path = lib_path or Path(__file__).parent.resolve() / _get_lib_filename()
 
-    try:
-        lib = ctypes.CDLL(str(lib_path))
-        lib.inspect_payload_index.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        lib.inspect_payload_index.restype = ctypes.c_int
-        logger.info("[+] Native C DPI Engine loaded successfully (libdpi).")
-        return lib
-    except (OSError, AttributeError) as e:
-        logger.warning(
-            f"[!] Failed to load native C DPI engine: {e}. "
-            f"If you compiled an older libdpi without inspect_payload_index, rebuild via 'make -C c_src'. "
-            f"Falling back to Aho-Corasick only."
-        )
-        return None
+        if not lib_path.exists():
+            logger.info(f"[+] Note: '{lib_path.name}' not found. Native C DPI disabled "
+                        f"(run 'make -C c_src'). Keyword DPI only.")
+            return
+        try:
+            lib = ctypes.CDLL(str(lib_path))
+            lib.inspect_payload_index.argtypes = [ctypes.c_char_p, ctypes.c_int]
+            lib.inspect_payload_index.restype = ctypes.c_int
+            lib.signature_count.restype = ctypes.c_int
+            lib.signature_name.argtypes = [ctypes.c_int]
+            lib.signature_name.restype = ctypes.c_char_p
+            lib.max_signature_len.restype = ctypes.c_int
+            self._lib = lib
+            self.names = [lib.signature_name(i).decode() for i in range(lib.signature_count())]
+            self.max_len = lib.max_signature_len()
+            self.available = True
+            logger.info(f"[+] Native C DPI engine loaded ({len(self.names)} signatures).")
+        except (OSError, AttributeError) as e:
+            logger.warning(f"[!] Failed to load native C DPI engine: {e}. Rebuild with 'make -C c_src'.")
+
+    def scan(self, data: bytes) -> Optional[str]:
+        if not self.available or not data:
+            return None
+        idx = self._lib.inspect_payload_index(data, len(data))
+        return self.names[idx] if 0 <= idx < len(self.names) else None
 
 
+class KeywordEngine:
+    """Aho-Corasick multi-pattern scan (pure-Python fallback if pyahocorasick is missing).
+
+    Patterns target cleartext *credential/query leaks*, not generic words: a
+    page that merely contains the word "password" must not alert.
+    """
+    DEFAULT_KEYWORDS = [b"password=", b"passwd=", b"pwd=", b"authorization: basic",
+                        b"api_key=", b"apikey=", b"select * from"]
+
+    def __init__(self, keywords=None):
+        self.keywords = [k.lower() for k in (keywords or self.DEFAULT_KEYWORDS)]
+        self.max_len = max(len(k) for k in self.keywords)
+        self.automaton = None
+        if HAS_AHOCORASICK:
+            self.automaton = ahocorasick.Automaton()
+            for kw in self.keywords:
+                text = kw.decode("latin-1")
+                self.automaton.add_word(text, text)
+            self.automaton.make_automaton()
+
+    def scan(self, data: bytes, min_end: int = 0) -> set:
+        """Keywords found whose match ends at or after byte `min_end`
+        (lets callers ignore matches already reported from a previous segment)."""
+        lowered = data.lower()  # ASCII-only lowering, byte positions preserved
+        hits = set()
+        if self.automaton is not None:
+            for end_index, kw in self.automaton.iter(lowered.decode("latin-1")):
+                if end_index + 1 > min_end:
+                    hits.add(kw)
+        else:
+            for kw in self.keywords:
+                pos = lowered.rfind(kw)
+                if pos != -1 and pos + len(kw) > min_end:
+                    hits.add(kw.decode("latin-1"))
+        return hits
+
+
+# ---------------------------------------------------------------------------
+# Core engine
+# ---------------------------------------------------------------------------
 class NetworkGuardian:
-    def __init__(self, dos_threshold=500, scan_threshold=50, time_window_sec=10, cleanup_interval_sec=30):
-        self.logger = setup_logger()
-        self.packet_queue = Queue(maxsize=20000)
+    MAX_TRACKED_FLOWS = 10_000
+    FLOW_TTL_SEC = 30
+    DNS_ENTROPY_THRESHOLD = 4.3
+    DNS_MAX_LABEL_LEN = 45
+
+    def __init__(self, dos_threshold=500, scan_threshold=50, time_window_sec=10,
+                 cleanup_interval_sec=30, block_duration_sec=300, queue_size=20000,
+                 whitelist=(), local_ips=None, dry_run=False, log_dir="logs", firewall=None):
+        self.logger = setup_logger(log_dir)
+        self.packet_queue = Queue(maxsize=queue_size)
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
 
         self.DOS_THRESHOLD = dos_threshold
         self.SCAN_THRESHOLD = scan_threshold
-        self.TIME_WINDOW = timedelta(seconds=time_window_sec)
+        self.TIME_WINDOW = float(time_window_sec)
         self.CLEANUP_INTERVAL = cleanup_interval_sec
+        self.BLOCK_DURATION = block_duration_sec
 
-        self.blacklist = {}  # {ip: unblock_time}
-
+        # State guarded by self.lock. Timestamps use time.monotonic() so a
+        # wall-clock change (NTP, DST, manual) cannot corrupt the windows.
+        self.blacklist = {}  # {ip: unblock_monotonic_time}
         self.syn_history = defaultdict(lambda: deque(maxlen=1000))
         self.port_history = defaultdict(lambda: deque(maxlen=1000))
 
-        # Layer-7 keyword signatures (matched by the Aho-Corasick engine below)
-        self.suspicious_keywords = [b"admin", b"password", b"etc/passwd", b"select * from"]
+        # Per-flow tail so a signature split across two TCP segments is still seen.
+        self._flow_tails = OrderedDict()
+        self._tail_lock = threading.Lock()
+
+        # Observability of the engine itself
+        self.captured = 0
+        self.dropped = 0
+        self.alerts = deque(maxlen=1000)
+
+        # Direction + whitelist. Without a known local address we cannot tell
+        # inbound from outbound, so every packet is treated as inbound.
+        self.local_ips = set(local_ips) if local_ips is not None else discover_local_ips()
+        nets = [ipaddress.ip_network("127.0.0.0/8")]
+        nets += [ipaddress.ip_network(ip, strict=False) for ip in self.local_ips]
+        gw = discover_default_gateway() if local_ips is None else None
+        if gw:
+            nets.append(ipaddress.ip_network(gw))
+        nets += [ipaddress.ip_network(w, strict=False) for w in whitelist]
+        self.whitelist_nets = nets
+
+        self.firewall = firewall or FirewallManager(self.logger, dry_run=dry_run)
+        self.keywords = KeywordEngine()
+        self.native = NativeSignatureEngine(self.logger)
+        self._tail_len = max(self.keywords.max_len, self.native.max_len) - 1
 
         if HAS_AHOCORASICK:
-            self.automaton = ahocorasick.Automaton()
-            for idx, key in enumerate(self.suspicious_keywords):
-                key_str = key.decode('utf-8', errors='ignore').lower() if isinstance(key, bytes) else str(key).lower()
-                key_bytes = key.lower() if isinstance(key, bytes) else key.encode('utf-8').lower()
-                self.automaton.add_word(key_str, (idx, key_bytes))
-            self.automaton.make_automaton()
-            self.logger.info("[+] Aho-Corasick Bytes DPI Engine initialized successfully.")
+            self.logger.info("[+] Aho-Corasick keyword engine initialized.")
         else:
-            self.automaton = None
-            self.logger.info("[+] Note: 'pyahocorasick' library not found. Falling back to native bytes searching.")
+            self.logger.info("[+] Note: 'pyahocorasick' not found; using substring fallback.")
 
-        # Native C engine: bounds-checked signature scan for injection-style
-        # attacks (SQLi, XSS, path traversal, command injection). Runs
-        # alongside, not instead of, the Aho-Corasick keyword scan above.
-        self.c_dpi = _load_c_dpi_engine(self.logger)
+    # -- helpers -----------------------------------------------------------
+    def _alert(self, level, event_type, src_ip, message, details):
+        self.alerts.append({"event_type": event_type, "src_ip": src_ip, "details": details})
+        self.logger.log(level, message, extra={"src_ip": src_ip, "event_type": event_type, "details": details})
 
-    def _is_blacklisted(self, src_ip, now):
-        """Must be called inside lock."""
-        exp_time = self.blacklist.get(src_ip)
-        if exp_time:
-            if now < exp_time:
-                return True
-            else:
-                del self.blacklist[src_ip]
-        return False
-
-    def _enqueue_packet(self, pkt):
-        if not pkt.haslayer(IP):
-            return
-
-        src_ip = pkt[IP].src
-        now = datetime.now()
-
-        with self.lock:
-            if self._is_blacklisted(src_ip, now):
-                return
-
+    def _is_whitelisted(self, ip: str) -> bool:
         try:
-            self.packet_queue.put_nowait(pkt)
-        except Exception:
-            pass
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.whitelist_nets)
+
+    def _is_inbound(self, dst_ip: str) -> bool:
+        return not self.local_ips or dst_ip in self.local_ips
+
+    def _is_blacklisted(self, src_ip, now) -> bool:
+        # Lock-free read (single dict.get). Expired entries are removed by the cleanup thread.
+        exp = self.blacklist.get(src_ip)
+        return exp is not None and now < exp
 
     def _clean_old_records(self, history_deque, now):
         while history_deque and (now - history_deque[0][0]) > self.TIME_WINDOW:
             history_deque.popleft()
 
-    def _cleanup_worker(self):
-        while not self.stop_event.is_set():
-            time.sleep(self.CLEANUP_INTERVAL)
-            now = datetime.now()
-
-            with self.lock:
-                for ip in list(self.syn_history.keys()):
-                    history = self.syn_history[ip]
-                    self._clean_old_records(history, now)
-                    if not history:
-                        del self.syn_history[ip]
-
-                for ip in list(self.port_history.keys()):
-                    history = self.port_history[ip]
-                    self._clean_old_records(history, now)
-                    if not history:
-                        del self.port_history[ip]
-
-                expired = [ip for ip, exp_time in self.blacklist.items() if now >= exp_time]
-                for ip in expired:
-                    del self.blacklist[ip]
-
-    def _check_dpi_keywords(self, payload: bytes, src_ip: str):
-        """Aho-Corasick (or pure-Python fallback) keyword scan."""
-        payload_str = payload.decode('utf-8', errors='ignore').lower()
-        matched_keywords = set()
-
-        if self.automaton:
-            for end_index, (idx, kw_bytes) in self.automaton.iter(payload_str):
-                matched_keywords.add(kw_bytes.decode('utf-8', errors='ignore'))
-        else:
-            payload_lower = payload.lower()
-            for kw in self.suspicious_keywords:
-                if kw.lower() in payload_lower:
-                    matched_keywords.add(kw.decode('utf-8', errors='ignore'))
-
-        for kw_str in matched_keywords:
-            self.logger.warning(
-                f"[SECURITY DPI] Suspicious keyword '{kw_str}' from {src_ip}",
-                extra={"src_ip": src_ip, "event_type": "DPI_ALERT", "details": f"Keyword match: {kw_str}"}
-            )
-
-    def _check_dpi_native(self, payload: bytes, src_ip: str):
-        """Native C signature scan (SQLi / XSS / path traversal / cmd injection)."""
-        if self.c_dpi is None:
+    # -- capture side ------------------------------------------------------
+    def _enqueue_packet(self, pkt):
+        if not pkt.haslayer(IP):
             return
-
+        self.captured += 1
+        if self._is_blacklisted(pkt[IP].src, time.monotonic()):
+            return
         try:
-            idx = self.c_dpi.inspect_payload_index(payload, len(payload))
-        except Exception as e:
-            self.logger.debug(f"[DPI-C] Native engine call failed: {e}")
-            return
+            self.packet_queue.put_nowait(pkt)
+        except Full:
+            self.dropped += 1  # backpressure: drop, but count it
 
-        if idx is not None and idx >= 0:
-            sig_name = NATIVE_SIGNATURE_NAMES[idx] if idx < len(NATIVE_SIGNATURE_NAMES) else f"index {idx}"
-            self.logger.warning(
-                f"[SECURITY DPI-C] Native signature match '{sig_name}' from {src_ip}",
-                extra={"src_ip": src_ip, "event_type": "DPI_ALERT_NATIVE", "details": f"Native C signature match: {sig_name}"}
-            )
-
-    def _check_dpi(self, payload: bytes, src_ip: str):
-        self._check_dpi_keywords(payload, src_ip)
-        self._check_dpi_native(payload, src_ip)
-
-    def analyze_packet(self, pkt):
-        now = datetime.now()
-        src_ip = pkt[IP].src
-
+    # -- housekeeping ------------------------------------------------------
+    def _cleanup_once(self, now=None):
+        now = time.monotonic() if now is None else now
         with self.lock:
-            if self._is_blacklisted(src_ip, now):
-                return
+            for table in (self.syn_history, self.port_history):
+                for ip in list(table.keys()):
+                    self._clean_old_records(table[ip], now)
+                    if not table[ip]:
+                        del table[ip]
+            expired = [ip for ip, exp in self.blacklist.items() if now >= exp]
+            for ip in expired:
+                del self.blacklist[ip]
 
-        # 1. DNS Inspection & Tunneling Detection
-        if pkt.haslayer(DNSQR):
+        for ip in expired:  # outside the lock: firewall calls are slow
+            self.firewall.unblock(ip)
+
+        with self._tail_lock:
+            stale = [f for f, (ts, _) in self._flow_tails.items() if now - ts > self.FLOW_TTL_SEC]
+            for f in stale:
+                del self._flow_tails[f]
+
+        if self.dropped:
+            self.logger.warning(
+                f"[STATS] captured={self.captured} dropped={self.dropped} queue={self.packet_queue.qsize()}",
+                extra={"event_type": "ENGINE_STATS", "details": f"dropped={self.dropped}"})
+
+    def _cleanup_worker(self):
+        while not self.stop_event.wait(self.CLEANUP_INTERVAL):
+            self._cleanup_once()
+
+    # -- DPI ---------------------------------------------------------------
+    def _check_dpi(self, payload: bytes, src_ip: str, flow=None, now=None):
+        now = time.monotonic() if now is None else now
+        data = unquote_to_bytes(payload) if b"%" in payload else payload  # defeat %2e%2e%2f-style encoding
+
+        tail = b""
+        if flow is not None:
+            with self._tail_lock:
+                entry = self._flow_tails.get(flow)
+                if entry:
+                    tail = entry[1]
+
+        combined = tail + data
+        keyword_hits = self.keywords.scan(combined, min_end=len(tail))
+
+        native_hit = self.native.scan(data)
+        if native_hit is None and tail and self.native.available:
+            # Only the segment boundary can hold a match we haven't seen yet.
+            native_hit = self.native.scan(tail + data[: self.native.max_len - 1])
+
+        for kw in sorted(keyword_hits):
+            self._alert(logging.WARNING, "DPI_ALERT", src_ip,
+                        f"[SECURITY DPI] Cleartext keyword '{kw}' from {src_ip}", f"Keyword match: {kw}")
+        if native_hit:
+            self._alert(logging.WARNING, "DPI_ALERT_NATIVE", src_ip,
+                        f"[SECURITY DPI-C] Signature match '{native_hit}' from {src_ip}",
+                        f"Native C signature match: {native_hit}")
+
+        if flow is not None and self._tail_len > 0:
+            new_tail = b"" if (keyword_hits or native_hit) else combined[-self._tail_len:]
+            with self._tail_lock:
+                self._flow_tails[flow] = (now, new_tail)
+                self._flow_tails.move_to_end(flow)
+                while len(self._flow_tails) > self.MAX_TRACKED_FLOWS:
+                    self._flow_tails.popitem(last=False)
+
+    # -- analysis ----------------------------------------------------------
+    def analyze_packet(self, pkt, now=None):
+        now = time.monotonic() if now is None else now
+        ip = pkt[IP]
+        src_ip, dst_ip = ip.src, ip.dst
+
+        if self._is_blacklisted(src_ip, now):
+            return
+        inbound = self._is_inbound(dst_ip)
+
+        # 1. DNS tunneling - QUERIES only (qr == 0). Responses echo the question
+        #    section, which would misattribute the alert to the resolver.
+        if pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt[DNS].qr == 0:
             try:
-                raw_query = pkt[DNSQR].qname
-                query = raw_query.decode('ascii', errors='ignore').strip('.')
-
+                query = pkt[DNSQR].qname.decode("ascii", errors="ignore").strip(".")
                 if query and not query.endswith(".local"):
-                    subdomain = query.split('.')[0]
+                    subdomain = query.split(".")[0]
                     entropy = calculate_entropy(subdomain)
-
-                    if len(subdomain) > 45 or entropy > 4.3:
-                        self.logger.warning(
-                            f"[DNS TUNNELING SUSPECT] Host {src_ip} query len={len(query)} entropy={entropy:.2f}: {query}",
-                            extra={"src_ip": src_ip, "event_type": "DNS_TUNNELING", "details": f"Len: {len(query)}, Entropy: {entropy:.2f}"}
-                        )
+                    if len(subdomain) > self.DNS_MAX_LABEL_LEN or entropy > self.DNS_ENTROPY_THRESHOLD:
+                        self._alert(logging.WARNING, "DNS_TUNNELING", src_ip,
+                                    f"[DNS TUNNELING SUSPECT] Host {src_ip} query len={len(query)} entropy={entropy:.2f}: {query}",
+                                    f"Len: {len(query)}, Entropy: {entropy:.2f}")
                     else:
-                        self.logger.info(
-                            f"[DNS] Device {src_ip} query: {query}",
-                            extra={"src_ip": src_ip, "event_type": "DNS_QUERY", "details": query}
-                        )
+                        self.logger.info(f"[DNS] Device {src_ip} query: {query}",
+                                         extra={"src_ip": src_ip, "event_type": "DNS_QUERY", "details": query})
             except Exception as e:
                 self.logger.debug(f"[DNS] Parsing error: {e}")
 
         dst_port = None
-        is_syn = False
+        proto = None
+        is_pure_syn = False  # SYN without ACK = a connection attempt (SYN-ACK is a reply, not an attack)
+        is_probe = False     # packet that looks like a port probe
+        flow = None
 
         if pkt.haslayer(TCP):
-            dst_port = pkt[TCP].dport
-            tcp_flags = int(pkt[TCP].flags)
-
-            if tcp_flags & 0x02:  # SYN Flag
-                is_syn = True
-
-            # 2. Bitwise Stealth Scan Detection
-            fin = bool(tcp_flags & 0x01)
-            syn = bool(tcp_flags & 0x02)
-            rst = bool(tcp_flags & 0x04)
-            psh = bool(tcp_flags & 0x08)
-            ack = bool(tcp_flags & 0x10)
-            urg = bool(tcp_flags & 0x20)
+            tcp = pkt[TCP]
+            dst_port, proto = tcp.dport, "tcp"
+            flags = int(tcp.flags)
+            fin, syn, rst = bool(flags & 0x01), bool(flags & 0x02), bool(flags & 0x04)
+            psh, ack, urg = bool(flags & 0x08), bool(flags & 0x10), bool(flags & 0x20)
+            is_pure_syn = syn and not ack
+            flow = (src_ip, tcp.sport, dst_ip, tcp.dport)
 
             stealth_type = None
-            if tcp_flags == 0:
+            if (flags & 0x3F) == 0:
                 stealth_type = "NULL Scan"
             elif fin and not (syn or rst or psh or ack or urg):
                 stealth_type = "FIN Scan"
@@ -391,91 +529,113 @@ class NetworkGuardian:
                 stealth_type = "XMAS Scan"
 
             if stealth_type:
-                self.logger.warning(
-                    f"[STEALTH SCAN DETECTED] {stealth_type} from {src_ip} to port {dst_port}",
-                    extra={"src_ip": src_ip, "event_type": "STEALTH_SCAN", "details": f"{stealth_type} on port {dst_port}"}
-                )
+                self._alert(logging.WARNING, "STEALTH_SCAN", src_ip,
+                            f"[STEALTH SCAN DETECTED] {stealth_type} from {src_ip} to port {dst_port}",
+                            f"{stealth_type} on port {dst_port}")
+            is_probe = is_pure_syn or bool(stealth_type)
 
         elif pkt.haslayer(UDP):
-            dst_port = pkt[UDP].dport
+            udp = pkt[UDP]
+            dst_port, proto = udp.dport, "udp"
+            is_probe = True
+            flow = (src_ip, udp.sport, dst_ip, udp.dport)
 
-        # 3. DoS & Port Scan Detection (Atomic State Updates)
-        with self.lock:
-            if is_syn:
-                syn_deque = self.syn_history[src_ip]
-                self._clean_old_records(syn_deque, now)
-                syn_deque.append((now, None))
+        # 2. DoS and port-scan windows - INBOUND traffic only. Our own outbound
+        #    connections and replies must never count as an attack.
+        block_ip = None
+        if inbound:
+            with self.lock:
+                if is_pure_syn:
+                    syn_deque = self.syn_history[src_ip]
+                    self._clean_old_records(syn_deque, now)
+                    syn_deque.append((now, None))
+                    if len(syn_deque) > self.DOS_THRESHOLD:
+                        syn_deque.clear()
+                        if self._is_whitelisted(src_ip):
+                            self._alert(logging.WARNING, "DOS_ATTACK_WHITELISTED", src_ip,
+                                        f"[DoS THRESHOLD] {src_ip} exceeded SYN threshold but is whitelisted - NOT blocked",
+                                        "SYN threshold exceeded (whitelisted)")
+                        else:
+                            self.blacklist[src_ip] = now + self.BLOCK_DURATION
+                            block_ip = src_ip
 
-                if len(syn_deque) > self.DOS_THRESHOLD:
-                    self.blacklist[src_ip] = now + timedelta(minutes=5)
-                    block_ip_firewall_async(src_ip)
-                    self.logger.critical(
-                        f"[DoS DETECTED] Isolating IP: {src_ip} for 5 minutes (Firewall Rule Applied)",
-                        extra={"src_ip": src_ip, "event_type": "DOS_ATTACK", "details": "SYN Flood threshold exceeded"}
-                    )
-                    syn_deque.clear()
+                if is_probe and dst_port is not None:
+                    ports_deque = self.port_history[src_ip]
+                    self._clean_old_records(ports_deque, now)
+                    ports_deque.append((now, (proto, dst_port)))
+                    if len(ports_deque) > self.SCAN_THRESHOLD:  # unique <= len, so skip the set build otherwise
+                        unique = {p for _, p in ports_deque}
+                        if len(unique) > self.SCAN_THRESHOLD:
+                            self._alert(logging.WARNING, "PORT_SCAN", src_ip,
+                                        f"[PORT SCAN DETECTED] Host {src_ip} probed {len(unique)} unique ports",
+                                        f"{len(unique)} ports scanned")
+                            ports_deque.clear()
 
-            if dst_port is not None:
-                ports_deque = self.port_history[src_ip]
-                self._clean_old_records(ports_deque, now)
-                ports_deque.append((now, dst_port))
+            if block_ip:
+                self._alert(logging.CRITICAL, "DOS_ATTACK", block_ip,
+                            f"[DoS DETECTED] Isolating IP: {block_ip} for {self.BLOCK_DURATION}s",
+                            "SYN Flood threshold exceeded")
+                self.firewall.block(block_ip)
 
-                unique_ports = {port for _, port in ports_deque}
-                if len(unique_ports) > self.SCAN_THRESHOLD:
-                    self.logger.warning(
-                        f"[PORT SCAN DETECTED] Host {src_ip} scanned {len(unique_ports)} unique ports",
-                        extra={"src_ip": src_ip, "event_type": "PORT_SCAN", "details": f"{len(unique_ports)} ports scanned"}
-                    )
-                    ports_deque.clear()
-
-        # 4. Deep Packet Inspection (DPI) — Aho-Corasick keywords + Native C signatures.
-        # Skipped for well-known encrypted ports and non-plaintext-looking payloads,
-        # since substring DPI over encrypted/binary bytes is both wasted work and a
-        # false-positive risk.
+        # 3. DPI - decided by payload content, not by port.
         if pkt.haslayer(Raw):
             payload = pkt[Raw].load
-            if dst_port not in COMMON_ENCRYPTED_PORTS and _looks_like_plaintext(payload):
-                self._check_dpi(payload, src_ip)
+            if _looks_like_plaintext(payload):
+                self._check_dpi(payload, src_ip, flow, now)
 
+    # -- threads -----------------------------------------------------------
     def packet_worker(self):
         while not self.stop_event.is_set():
             try:
                 packet = self.packet_queue.get(timeout=0.5)
-                self.analyze_packet(packet)
-                self.packet_queue.task_done()
             except Empty:
                 continue
+            try:
+                self.analyze_packet(packet)
             except Exception as e:
                 self.logger.error(f"[WORKER ERROR] {e}")
+            finally:
+                self.packet_queue.task_done()
 
-    def start(self, num_workers=4):
-        self.logger.info("NetworkGuardian Engine Starting...")
+    def start(self, num_workers=4, iface=None):
+        self.logger.info("WireWarden engine starting...")
+        workers = [threading.Thread(target=self.packet_worker, daemon=True, name=f"Worker-{i}")
+                   for i in range(num_workers)]
+        cleanup = threading.Thread(target=self._cleanup_worker, daemon=True, name="CleanupGC")
+        for t in workers + [cleanup]:
+            t.start()
 
-        workers = []
-        for i in range(num_workers):
-            w = threading.Thread(target=self.packet_worker, daemon=True, name=f"Worker-{i}")
-            w.start()
-            workers.append(w)
-
-        cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True, name="CleanupGC")
-        cleanup_thread.start()
-
-        self.logger.info(f"[*] Engine Active. Listening with {num_workers} worker threads...")
+        self.logger.info(f"[*] Engine active: {num_workers} workers, local IPs={sorted(self.local_ips)}")
         try:
-            sniff(
-                prn=self._enqueue_packet,
-                store=0,
-                filter="ip",
-                stop_filter=lambda _: self.stop_event.is_set()
-            )
+            sniff(prn=self._enqueue_packet, store=0, filter="ip", iface=iface,
+                  stop_filter=lambda _: self.stop_event.is_set())
         except KeyboardInterrupt:
             self.logger.info("Shutting down engine...")
+        finally:
             self.stop_event.set()
-            for w in workers:
-                w.join(timeout=2)
-            cleanup_thread.join(timeout=2)
+            for t in workers + [cleanup]:
+                t.join(timeout=2)
+            self.firewall.unblock_all()  # leave the host firewall as we found it
+            self.logger.info(f"[STATS] captured={self.captured} dropped={self.dropped}")
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="WireWarden NIDS/NIPS")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--iface", default=None, help="interface to sniff (default: scapy default)")
+    p.add_argument("--whitelist", default="", help="comma-separated IPs/CIDRs that must never be blocked")
+    p.add_argument("--dry-run", action="store_true", help="detect and log, but never touch the firewall")
+    p.add_argument("--dos-threshold", type=int, default=500)
+    p.add_argument("--scan-threshold", type=int, default=50)
+    p.add_argument("--block-seconds", type=int, default=300)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":
-    guardian = NetworkGuardian(dos_threshold=500, scan_threshold=50, time_window_sec=10)
-    guardian.start(num_workers=4)
+    args = parse_args()
+    guardian = NetworkGuardian(
+        dos_threshold=args.dos_threshold, scan_threshold=args.scan_threshold,
+        block_duration_sec=args.block_seconds,
+        whitelist=[w.strip() for w in args.whitelist.split(",") if w.strip()],
+        dry_run=args.dry_run)
+    guardian.start(num_workers=args.workers, iface=args.iface)

@@ -54,6 +54,32 @@ def test_dpi_signatures() -> None:
     print("[✔] DPI Test Suite Finished!")
 
 
+def test_dpi_evasion_attempts() -> None:
+    """Case variants and a signature split across two TCP segments (same flow)."""
+    print_step("Testing DPI evasion resistance (case variants + segment split)")
+
+    print("  [>] Mixed-case SQL injection...")
+    send(IP(dst=TARGET_IP) / TCP(dport=80, sport=44001) /
+         Raw(load="GET /?id=1' uNiOn SeLeCt 1,2 HTTP/1.1\r\n\r\n"), verbose=False)
+    time.sleep(0.2)
+
+    print("  [>] Signature split across two segments of one flow...")
+    send(IP(dst=TARGET_IP) / TCP(dport=80, sport=44002) / Raw(load="GET /?q=1' UNI"), verbose=False)
+    time.sleep(0.2)
+    send(IP(dst=TARGET_IP) / TCP(dport=80, sport=44002) / Raw(load="ON SELECT pw FROM users HTTP/1.1\r\n"), verbose=False)
+
+    print("[✔] DPI evasion tests finished (expect 2 native DPI alerts)")
+
+
+def test_negative_control_syn_ack() -> None:
+    """SYN-ACK replies are NOT an attack: this burst must raise NO DoS alert and block nothing."""
+    print_step("Negative control: 600 SYN-ACK replies (must NOT trigger DoS)")
+    pkt = IP(src="203.0.113.60", dst=TARGET_IP) / TCP(sport=443, dport=40000, flags="SA")
+    for _ in range(600):
+        send(pkt, verbose=False)
+    print("[✔] Negative control sent (expect no DOS_ATTACK for 203.0.113.60)")
+
+
 def test_port_scan() -> None:
     """
     Simulates a horizontal port scan across 60 distinct ports (TCP SYN)
@@ -141,6 +167,12 @@ def main() -> None:
 
     try:
         test_dpi_signatures()
+        time.sleep(1)
+
+        test_dpi_evasion_attempts()
+        time.sleep(1)
+
+        test_negative_control_syn_ack()
         time.sleep(1)
 
         test_port_scan()

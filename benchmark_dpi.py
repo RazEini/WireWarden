@@ -1,144 +1,105 @@
+"""DPI micro-benchmark: native C signature engine vs. pure-Python baselines.
+
+Reports FOUR numbers so the result can't be misread:
+
+  * Python loop   - naive baseline: lowercase once, `sig in payload` per signature
+  * Python regex  - stronger baseline: ONE compiled, case-insensitive alternation
+  * C per-call    - what the live pipeline actually does (one ctypes call per packet)
+  * C batch       - one ctypes call for the whole batch (FFI overhead amortized)
+
+Only "C per-call" reflects the live path. "C batch" shows the engine's ceiling.
+All engines match the same signatures, case-insensitively.
+"""
 import ctypes
 import gc
-import os
-from pathlib import Path
+import re
 import sys
 import time
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# 1. Load Native C Extension
-# ---------------------------------------------------------------------------
+
 def _get_lib_filename() -> str:
     if sys.platform == "win32":
         return "libdpi.dll"
-    elif sys.platform == "darwin":
+    if sys.platform == "darwin":
         return "libdpi.dylib"
-    else:
-        return "libdpi.so"
+    return "libdpi.so"
 
 
-BASE_DIR = Path(__file__).parent.resolve()
-lib_filename = _get_lib_filename()
-lib_path = BASE_DIR / lib_filename
-
+lib_path = Path(__file__).parent.resolve() / _get_lib_filename()
 if not lib_path.exists():
-    print(f"[-] Shared library not found at {lib_path}. Compile it first.")
+    print(f"[-] {lib_path.name} not found. Run: make -C c_src")
     sys.exit(1)
 
 c_lib = ctypes.CDLL(str(lib_path))
-
-c_lib.inspect_batch.argtypes = [
-    ctypes.POINTER(ctypes.c_char_p),
-    ctypes.POINTER(ctypes.c_int),
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),
-]
+c_lib.inspect_payload_index.argtypes = [ctypes.c_char_p, ctypes.c_int]
+c_lib.inspect_payload_index.restype = ctypes.c_int
+c_lib.inspect_batch.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int),
+                                ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 c_lib.inspect_batch.restype = ctypes.c_int
+c_lib.signature_count.restype = ctypes.c_int
+c_lib.signature_name.argtypes = [ctypes.c_int]
+c_lib.signature_name.restype = ctypes.c_char_p
+
+# Single source of truth: the signature list comes from the C library itself.
+SIGNATURES = [c_lib.signature_name(i) for i in range(c_lib.signature_count())]
+REGEX = re.compile(b"|".join(re.escape(s) for s in SIGNATURES), re.IGNORECASE)
 
 
-# ---------------------------------------------------------------------------
-# 2. Pure Python Engine Implementation
-#
-# NOTE: kept in sync with the SIGNATURES array in c_src/dpi.c. "../../" (6
-# bytes) is used instead of "../" (3 bytes) — short substrings risk matching
-# by chance inside high-entropy binary/encrypted payloads.
-# ---------------------------------------------------------------------------
-SIGNATURES_PY = [
-    b"' OR '1'='1",
-    b"UNION SELECT",
-    b"<script>",
-    b"../../",
-    b"etc/passwd",
-    b"cmd.exe",
-    b"; whoami",
-]
+def py_loop(payload: bytes) -> bool:
+    low = payload.lower()
+    for sig in SIGNATURES:
+        if sig in low:
+            return True
+    return False
 
 
-def inspect_payload_py(payload: bytes) -> int:
-    for sig in SIGNATURES_PY:
-        if sig in payload:
-            return 1
-    return 0
+def py_regex(payload: bytes) -> bool:
+    return REGEX.search(payload) is not None
 
 
-def run_python_benchmark(payloads: list[bytes]) -> float:
-    # Disable GC and clean memory prior to execution
+def c_single(payload: bytes) -> bool:
+    return c_lib.inspect_payload_index(payload, len(payload)) >= 0
+
+
+def timed(fn) -> float:
     gc.collect()
     gc.disable()
     try:
-        start_time = time.perf_counter()
-        _ = [inspect_payload_py(p) for p in payloads]
-        end_time = time.perf_counter()
-    finally:
-        gc.enable()
-    return end_time - start_time
-
-
-# ---------------------------------------------------------------------------
-# 3. Native C Extension Batch Benchmark
-# ---------------------------------------------------------------------------
-def prepare_c_buffers(payloads: list[bytes]):
-    count = len(payloads)
-
-    payload_ptrs = (ctypes.c_char_p * count)()
-    lengths = (ctypes.c_int * count)()
-    results = (ctypes.c_int * count)()
-
-    for i, p in enumerate(payloads):
-        payload_ptrs[i] = p
-        lengths[i] = len(p)
-
-    return payload_ptrs, lengths, count, results
-
-
-def run_c_batch_benchmark(payload_ptrs, lengths, count, results) -> float:
-    gc.collect()
-    gc.disable()
-    try:
-        start_time = time.perf_counter()
-        c_lib.inspect_batch(payload_ptrs, lengths, count, results)
-        end_time = time.perf_counter()
+        t0 = time.perf_counter()
+        fn()
+        return time.perf_counter() - t0
     finally:
         gc.enable()
 
-    return end_time - start_time
+
+def avg(fn, runs):
+    fn()  # warm-up
+    return sum(timed(fn) for _ in range(runs)) / runs
 
 
-# ---------------------------------------------------------------------------
-# 4. Benchmark Execution & Comparison (Averaged & Stable)
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    NUM_PACKETS = 100_000
-    NUM_RUNS = 5
+    N, RUNS = 100_000, 5
+    clean = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+    bad = b"POST /login HTTP/1.1\r\nHost: example.com\r\n\r\nusername=admin' OR '1'='1"
+    payloads = [bad if i % 10 == 0 else clean for i in range(N)]  # 10% malicious
 
-    sample_clean = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
-    sample_malicious = b"POST /login HTTP/1.1\r\nHost: example.com\r\n\r\nusername=admin' OR '1'='1"
+    # correctness first: all engines must agree on every payload
+    assert all(py_loop(p) == py_regex(p) == c_single(p) for p in (clean, bad)), "engines disagree"
 
-    print(f"=== WireWarden DPI Benchmark ({NUM_PACKETS:,} Packets | Averaged over {NUM_RUNS} runs) ===")
+    ptrs = (ctypes.c_char_p * N)(*payloads)
+    lens = (ctypes.c_int * N)(*[len(p) for p in payloads])
+    out = (ctypes.c_int * N)()
 
-    test_payloads = [
-        sample_malicious if i % 10 == 0 else sample_clean
-        for i in range(NUM_PACKETS)
+    results = [
+        ("Python loop  (naive)",            avg(lambda: [py_loop(p) for p in payloads], RUNS)),
+        ("Python regex (1 compiled, IGNORECASE)", avg(lambda: [py_regex(p) for p in payloads], RUNS)),
+        ("C per-call   (live-path style)",  avg(lambda: [c_single(p) for p in payloads], RUNS)),
+        ("C batch      (1 FFI call)",       avg(lambda: c_lib.inspect_batch(ptrs, lens, N, out), RUNS)),
     ]
-
-    c_buffers = prepare_c_buffers(test_payloads)
-
-    # Warmup runs to fill CPU caches
-    _ = run_python_benchmark(test_payloads)
-    _ = run_c_batch_benchmark(*c_buffers)
-
-    # Multi-run evaluation for Python
-    py_times = [run_python_benchmark(test_payloads) for _ in range(NUM_RUNS)]
-    py_avg_time = sum(py_times) / NUM_RUNS
-    py_pps = NUM_PACKETS / py_avg_time
-    print(f"🐍 Python Engine:  {py_avg_time:.4f} sec | {py_pps:,.0f} Packets/sec (Avg)")
-
-    # Multi-run evaluation for C
-    c_times = [run_c_batch_benchmark(*c_buffers) for _ in range(NUM_RUNS)]
-    c_avg_time = sum(c_times) / NUM_RUNS
-    c_pps = NUM_PACKETS / c_avg_time
-    print(f"⚡ C Extension:     {c_avg_time:.4f} sec | {c_pps:,.0f} Packets/sec (Avg)")
-
-    # Stable Speedup
-    speedup = py_avg_time / c_avg_time if c_avg_time > 0 else 0
-    print(f"🚀 Speedup Factor: {speedup:.2f}x faster with C Extension!")
+    base = results[0][1]
+    print(f"=== WireWarden DPI benchmark: {N:,} packets, {len(SIGNATURES)} signatures, avg of {RUNS} runs ===")
+    print(f"{'engine':42s} {'time':>9s} {'pkts/sec':>12s} {'vs naive':>9s}")
+    for name, t in results:
+        print(f"{name:42s} {t:8.4f}s {N / t:12,.0f} {base / t:8.2f}x")
+    print("\nNote: only 'C per-call' reflects the live pipeline; 'C batch' is the engine's ceiling.")

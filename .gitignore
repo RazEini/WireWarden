@@ -12,6 +12,8 @@ ENV/
 # Logs and databases
 *.log
 *.txt
+!requirements.txt
+!requirements-dev.txt
 *.sqlite3
 
 # OS generated files
@@ -39,3 +41,5 @@ logs/
 *.so
 *.dll
 *.o
+c_src/fuzz_dpi
+.pytest_cache/

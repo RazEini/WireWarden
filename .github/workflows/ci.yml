@@ -1,0 +1,21 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-dev.txt
+      - name: Build native DPI library (warnings are errors)
+        run: make -C c_src CFLAGS="-shared -fPIC -O3 -Wall -Wextra -Werror"
+      - name: Unit + regression tests
+        run: python -m pytest tests -v
+      - name: Memory-safety fuzzing (ASan + UBSan)
+        run: make -C c_src fuzz ITER=500000

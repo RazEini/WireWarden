@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -8,79 +9,112 @@
 #endif
 
 typedef struct {
-    const char *pattern;
+    const char *pattern;   /* stored in lowercase; matching is ASCII case-insensitive */
     size_t len;
 } Signature;
 
+#define SIG(s) { s, sizeof(s) - 1 }
+
 /*
- * NOTE on signature lengths: DPI over raw/encrypted traffic risks false
- * positives when a signature is short enough to appear by chance in
- * high-entropy (e.g. TLS-encrypted) byte streams. "../" at 3 bytes was too
- * short for this; "../../" at 6 bytes is a much safer minimum. As a rule of
- * thumb, avoid substring signatures under ~5-6 bytes for byte-level scanning.
+ * Signature table. All patterns are lowercase because the matcher lowercases
+ * the payload byte-by-byte (ASCII only) while comparing.
+ *
+ * Length rule of thumb: avoid substrings under ~6 bytes. Short signatures
+ * match by chance inside binary data and cause false positives.
+ *
+ * This is the single source of truth: main.py and benchmark_dpi.py read the
+ * names back through signature_count() / signature_name(), so there is no
+ * second copy to keep in sync.
  */
 static const Signature SIGNATURES[] = {
-    {"' OR '1'='1", 11},
-    {"UNION SELECT", 12},
-    {"<script>",     8},
-    {"../../",       6},
-    {"etc/passwd",  10},
-    {"cmd.exe",      7},
-    {"; whoami",     8},
-    {NULL,          0}
+    SIG("' or '1'='1"),    /* SQLi: classic tautology        */
+    SIG(" or 1=1"),        /* SQLi: numeric tautology        */
+    SIG("union select"),   /* SQLi: UNION-based              */
+    SIG("union all select"),
+    SIG("<script"),        /* XSS: script tag (with/without attributes) */
+    SIG("javascript:"),    /* XSS: URI scheme                */
+    SIG("onerror="),       /* XSS: event handler             */
+    SIG("../../"),         /* Path traversal (POSIX)         */
+    SIG("..\\..\\"),       /* Path traversal (Windows)       */
+    SIG("etc/passwd"),     /* Sensitive file access          */
+    SIG("etc/shadow"),
+    SIG("cmd.exe"),        /* Command injection (Windows)    */
+    SIG("/bin/sh"),        /* Command injection (POSIX)      */
+    SIG("; whoami"),       /* Command chaining               */
 };
 
-/* 
- * Safe substring matching for raw binary payloads.
- * Avoids strstr() to prevent out-of-bounds reads on non-null-terminated buffers.
- */
-static inline int safe_payload_contains(const char *payload, size_t payload_len, const char *pattern, size_t pattern_len) {
-    if (pattern_len > payload_len || pattern_len == 0) return 0;
+#define NUM_SIGNATURES ((int)(sizeof(SIGNATURES) / sizeof(SIGNATURES[0])))
 
-    const char *ptr = payload;
-    size_t remaining = payload_len;
-
-    while (remaining >= pattern_len) {
-        // Fast-forward to candidate byte using SIMD-optimized libc memchr
-        ptr = (const char *)memchr(ptr, pattern[0], remaining - pattern_len + 1);
-        if (!ptr) return 0;
-
-        // Exact bound-checked byte comparison
-        if (memcmp(ptr, pattern, pattern_len) == 0) {
-            return 1;
-        }
-
-        ptr++;
-        remaining = payload_len - (size_t)(ptr - payload);
-    }
-    return 0;
+static inline unsigned char to_lower_ascii(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
 }
 
 /*
- * Returns the index into SIGNATURES of the first matching pattern, or -1
- * if none matched. Lets callers (e.g. main.py) log exactly which signature
- * fired instead of a generic "match" — useful for debugging false positives.
+ * Single-pass, ASCII case-insensitive multi-signature scan over a raw (not
+ * NUL-terminated) buffer.
+ *
+ * A 256-entry table marks which bytes can START a signature, so most payload
+ * bytes are rejected with one table lookup. Only candidate positions are
+ * compared against the (few) signatures that share that first byte.
+ *
+ * Bounds: a signature is compared only if i + len <= payload_len, so the
+ * highest byte ever read is index payload_len - 1.
+ *
+ * Returns the index of the signature that matches EARLIEST in the payload
+ * (ties: lowest table index), or -1.
  */
-EXPORT int inspect_payload_index(const char* payload, int payload_len) {
+EXPORT int inspect_payload_index(const char *payload, int payload_len) {
     if (!payload || payload_len <= 0) return -1;
 
-    for (int i = 0; SIGNATURES[i].pattern != NULL; i++) {
-        if (safe_payload_contains(payload, (size_t)payload_len, SIGNATURES[i].pattern, SIGNATURES[i].len)) {
-            return i;
+    unsigned char is_first[256];
+    memset(is_first, 0, sizeof(is_first));
+    for (int s = 0; s < NUM_SIGNATURES; s++) {
+        is_first[(unsigned char)SIGNATURES[s].pattern[0]] = 1;
+    }
+
+    const unsigned char *p = (const unsigned char *)payload;
+    const size_t n = (size_t)payload_len;
+
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = to_lower_ascii(p[i]);
+        if (!is_first[c]) continue;
+
+        for (int s = 0; s < NUM_SIGNATURES; s++) {
+            const Signature *sig = &SIGNATURES[s];
+            if ((unsigned char)sig->pattern[0] != c || sig->len > n - i) continue;
+            size_t j = 1;
+            while (j < sig->len && to_lower_ascii(p[i + j]) == (unsigned char)sig->pattern[j]) j++;
+            if (j == sig->len) return s;
         }
     }
     return -1;
 }
 
-EXPORT int inspect_payload(const char* payload, int payload_len) {
+EXPORT int inspect_payload(const char *payload, int payload_len) {
     return inspect_payload_index(payload, payload_len) >= 0 ? 1 : 0;
 }
 
-EXPORT int inspect_batch(const char** payloads, const int* lengths, int count, int* results) {
+EXPORT int inspect_batch(const char **payloads, const int *lengths, int count, int *results) {
     if (!payloads || !lengths || !results || count <= 0) return 0;
 
     for (int i = 0; i < count; i++) {
         results[i] = inspect_payload(payloads[i], lengths[i]);
     }
     return 1;
+}
+
+/* Introspection helpers so callers never hard-code the signature list. */
+EXPORT int signature_count(void) { return NUM_SIGNATURES; }
+
+EXPORT const char *signature_name(int index) {
+    if (index < 0 || index >= NUM_SIGNATURES) return NULL;
+    return SIGNATURES[index].pattern;
+}
+
+EXPORT int max_signature_len(void) {
+    size_t m = 0;
+    for (int i = 0; i < NUM_SIGNATURES; i++) {
+        if (SIGNATURES[i].len > m) m = SIGNATURES[i].len;
+    }
+    return (int)m;
 }
