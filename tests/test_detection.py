@@ -264,3 +264,49 @@ def test_dry_run_never_runs_a_command():
     fwm = FirewallManager(logging.getLogger("dry"), dry_run=True, runner=runner)
     fwm.block("203.0.113.9", blocking=True)
     assert runner.calls == []
+
+
+# ---- Windows (netsh) command construction ---------------------------------
+def test_windows_block_and_unblock_use_matching_netsh_commands(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    runner = scripted_runner([0, 0])
+    fwm = FirewallManager(logging.getLogger("win"), runner=runner)
+    ip = "203.0.113.9"
+
+    assert fwm.block(ip, blocking=True) is True
+    assert runner.calls[0] == ["netsh", "advfirewall", "firewall", "add", "rule",
+                               f"name=WireWarden_Block_{ip}", "dir=in", "action=block", f"remoteip={ip}"]
+    assert ip in fwm.rules
+
+    assert fwm.unblock(ip) is True
+    assert runner.calls[1] == ["netsh", "advfirewall", "firewall", "delete", "rule",
+                               f"name=WireWarden_Block_{ip}"]
+    assert fwm.rules == set()
+
+
+def test_windows_rule_name_matches_between_add_and_delete(monkeypatch):
+    """If the delete used a different rule name, blocks would never be lifted."""
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    runner = scripted_runner([0, 0])
+    fwm = FirewallManager(logging.getLogger("win2"), runner=runner)
+    fwm.block("198.51.100.4", blocking=True)
+    fwm.unblock("198.51.100.4")
+    add_name = next(a for a in runner.calls[0] if a.startswith("name="))
+    del_name = next(a for a in runner.calls[1] if a.startswith("name="))
+    assert add_name == del_name
+
+
+def test_windows_failed_add_is_not_recorded_as_applied(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    runner = scripted_runner([1])  # netsh returns non-zero (e.g. not elevated)
+    fwm = FirewallManager(logging.getLogger("win3"), runner=runner)
+    assert fwm.block("203.0.113.9", blocking=True) is False
+    assert fwm.rules == set()
+
+
+def test_unsupported_os_never_pretends_to_block(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Plan9")
+    runner = scripted_runner([])
+    fwm = FirewallManager(logging.getLogger("other"), runner=runner)
+    assert fwm.block("203.0.113.9", blocking=True) is False
+    assert runner.calls == [] and fwm.rules == set()
