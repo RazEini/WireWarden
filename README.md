@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/RazEini/WireWarden/actions/workflows/ci.yml"><img src="https://github.com/RazEini/WireWarden/actions/workflows/ci.yml/badge.svg" alt="CI Badge"></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python Badge">
   <img src="https://img.shields.io/badge/DPI-AhoCorasick_%2B_C-00599C?logo=c&logoColor=white" alt="DPI Badge">
   <img src="https://img.shields.io/badge/Library-Scapy-red" alt="Scapy Badge">
@@ -20,8 +21,35 @@
   <img src="https://img.shields.io/badge/Tests-pytest_%2B_ASan%2FUBSan_fuzz-success" alt="Tests Badge">
 </p>
 
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#dashboard">Dashboard</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#dpi-engines">DPI</a> ·
+  <a href="#structure">Structure</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#technologies">Technologies</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#testing">Testing</a> ·
+  <a href="#audit">Audit</a> ·
+  <a href="#limitations">Limitations</a>
+</p>
+
 ---
 
+## ✨ At a Glance
+
+| | |
+| :--- | :--- |
+| **Detects** | SYN floods, port scans, stealth scans (NULL / FIN / XMAS), DNS tunneling, injection attempts (SQLi, XSS, path traversal, command injection) and cleartext credentials |
+| **Responds** | Time-limited `iptables` / `netsh` blocks, removed on expiry and on shutdown, with a never-block list and a `--dry-run` mode |
+| **DPI speed** | C engine ≈ **1M packets/s per call** and ≈ **4M packets/s in batch**, versus ≈ 190K packets/s for a pure-Python loop (Windows, Python 3.13) |
+| **Quality** | 46 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
+| **Honest about limits** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are documented, not hidden |
+
+---
+
+<a id="overview"></a>
 ## 🔎 Overview & Architecture
 
 **WireWarden** monitors, analyzes, and responds to network security events across OSI layers 3, 4, and 7.
@@ -57,6 +85,7 @@ flowchart LR
 
 ---
 
+<a id="dashboard"></a>
 ## 📊 Dashboard Preview
 
 Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned automatically from code.
@@ -78,6 +107,7 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 
 ---
 
+<a id="performance"></a>
 ## ⚡ Performance & Resilience Analysis
 
 - **Memory Backpressure & Counted Drops** — A bounded `Queue(maxsize=20000)` combined with `store=0` in Scapy keeps memory bounded: the sniffer never accumulates packets, and the queue holds at most 20,000. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
@@ -88,6 +118,7 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 
 ---
 
+<a id="dpi-engines"></a>
 ## 🔬 DPI Engines: Live Detection vs. Throughput Benchmark
 
 WireWarden runs **two DPI engines together** in the live pipeline (`main.py`), each covering a different signature class, plus a standalone script that measures the C engine's throughput in isolation:
@@ -104,6 +135,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 ---
 
+<a id="benchmark"></a>
 ## 🏎️ DPI Native C Engine Performance
 
 - **Single-pass, bounds-checked scan** — A 256-entry first-byte table rejects most bytes with one lookup; only candidate positions are compared. A signature is compared only if it fits inside the buffer, so no read can pass `payload_len - 1` — safe on raw, non-NUL-terminated binary traffic. Verified by fuzzing under ASan/UBSan.
@@ -132,6 +164,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 ---
 
+<a id="structure"></a>
 ## 📂 Project Structure
 
 ```text
@@ -170,6 +203,7 @@ WireWarden/
 
 ---
 
+<a id="features"></a>
 ## 🚀 Core Features
 
 | Domain | Feature | Status | Description | Performance Indicator |
@@ -186,6 +220,7 @@ WireWarden/
 
 ---
 
+<a id="technologies"></a>
 ## 🛠️ Technologies & Architectural Highlights
 
 - **Python & Scapy** — Raw-socket-level packet capture, protocol parsing, and deep payload-level inspection (DPI).
@@ -200,6 +235,7 @@ WireWarden/
 
 ---
 
+<a id="entropy"></a>
 ### 🧬 Algorithmic Detection: Shannon Entropy for DNS Tunneling
 
 WireWarden identifies covert communication and data exfiltration over DNS by measuring the randomness (entropy) of the leftmost label of each DNS **query**.
@@ -214,6 +250,7 @@ Ordinary domain names follow predictable natural-language patterns, whereas enco
 
 ---
 
+<a id="prerequisites"></a>
 ## 📋 Prerequisites
 
 - **Git** — Required to clone the repository.
@@ -227,6 +264,7 @@ Ordinary domain names follow predictable natural-language patterns, whereas enco
 
 ---
 
+<a id="logs"></a>
 ## 📝 JSON Log Structure (Structured Logging)
 
 ```json
@@ -245,6 +283,7 @@ Event types: `PORT_SCAN`, `STEALTH_SCAN`, `DOS_ATTACK`, `DOS_ATTACK_WHITELISTED`
 
 ---
 
+<a id="quick-start"></a>
 ## ⚙️ Installation & Quick Start
 
 ```bash
@@ -306,17 +345,6 @@ python main.py --whitelist 10.0.0.0/24
 | `--dos-threshold` / `--scan-threshold` | 500 / 50 | Events per 10-second window |
 | `--workers` / `--iface` | 4 / default | Worker threads / interface to sniff |
 
-### Which traffic counts? (inbound vs. outbound)
-
-DoS and port-scan windows count **inbound** traffic only, meaning packets whose destination is one of this machine's own addresses. Your own outbound traffic and replies must never look like an attack. DPI, stealth-scan and DNS-tunneling detection look at traffic in both directions.
-
-That matters for the simulator. `test_attack.py` run **without an argument** targets your own IP, so every detector fires, including the red DoS block. If you point it at **another device** (e.g. your router), those packets leave your machine, so the DoS and port-scan alerts are skipped on purpose. To demo against another device, add the lab flag:
-
-```bash
-python main.py --include-outbound --dry-run     # --dry-run: alerts only, no firewall rule
-python test_attack.py 192.168.1.1               # router / other device
-```
-
 ### 7. Run Attack Simulator (in a separate terminal)
 
 ```bash
@@ -329,8 +357,20 @@ python test_attack.py <TARGET_IP>
 
 📊 **Accessing Grafana:** open [http://localhost:3000](http://localhost:3000) (username: `admin`, password from `.env`). All dashboards load automatically.
 
+### Which traffic counts? (inbound vs. outbound)
+
+DoS and port-scan windows count **inbound** traffic only, meaning packets whose destination is one of this machine's own addresses. Your own outbound traffic and replies must never look like an attack. DPI, stealth-scan and DNS-tunneling detection look at traffic in both directions.
+
+That matters for the simulator. `test_attack.py` run **without an argument** targets your own IP, so every detector fires, including the red DoS block. If you point it at **another device** (e.g. your router), those packets leave your machine, so the DoS and port-scan alerts are skipped on purpose. To demo against another device, add the lab flag:
+
+```bash
+python main.py --include-outbound --dry-run     # --dry-run: alerts only, no firewall rule
+python test_attack.py 192.168.1.1               # router / other device
+```
+
 ---
 
+<a id="testing"></a>
 ## 🧪 Testing & Quality Gates
 
 ```bash
@@ -340,14 +380,32 @@ python -m pytest tests -v        # 46 tests: detection logic, DPI engines, firew
 make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
-- **Regression tests** pin every defect found during the project's own audit: SYN-ACK counted as a flood; outbound traffic counted as an attack; DNS responses blamed on the resolver; firewall rules that never expired; port-based DPI bypass; case-sensitive signatures; split-segment evasion; duplicate log handlers. Each test was verified to fail when its bug is reintroduced.
-- **Firewall tests** verify the exact `iptables` and `netsh` commands that get built, that add and delete use the same rule name, and that a failed command is never recorded as applied. They use an injected command runner, so they prove command construction, not the OS's reaction — that needs a manual run with admin rights.
+- **Regression tests** pin every defect found during the project's own audit (see the table below). Each test was verified to fail when its bug is reintroduced.
+- **Firewall tests** verify the exact `iptables` and `netsh` commands that get built, that add and delete use the same rule name, and that a failed command is never recorded as applied. They use an injected command runner, so they prove command construction, not the OS's reaction — that needs a manual run with admin rights. The `netsh` commands were also run manually on Windows.
 - **Fuzzing** allocates every buffer at its exact size, so an out-of-bounds read is an ASan failure. It covers truncated and upper-cased signatures placed flush against the end of the buffer.
 - **CI** (`.github/workflows/ci.yml`) builds the C library with `-Wall -Wextra -Werror`, runs pytest on Python 3.10 and 3.12, and runs the ASan/UBSan fuzzer.
 - **`test_attack.py`** is a live simulator (synthetic traffic only) that exercises the real sniff path and the Grafana dashboards, including a SYN-ACK **negative control** that must not alert.
 
+<a id="audit"></a>
+### 🐞 Bugs Found by Auditing My Own Code
+
+After the first working version I audited it, reproduced each problem with a test, and fixed it. Every row has a regression test.
+
+| Defect | Impact | Fix |
+| :--- | :--- | :--- |
+| SYN-ACK counted as SYN | A busy server answering clients was blocked as a "DoS" source | Count only SYN without ACK |
+| Outbound traffic counted | The host's own connections and replies looked like attacks | DoS and port-scan windows count inbound only |
+| DNS responses inspected | The alert blamed the resolver instead of the asking host | Inspect queries only |
+| Firewall rules never removed | The log said "5 minutes" but the rule lasted forever | Track rules; remove on expiry and on shutdown |
+| "Rule applied" logged before the command ran | A failed `iptables` / `netsh` looked like success | Log the real exit status and stderr |
+| DPI skipped ports like 443 | Plaintext attacks on those ports slipped through | Choose payloads by content, not by port |
+| Case-sensitive signatures | `union select` in lowercase evaded detection | ASCII case-insensitive matching in C |
+| No handling of split segments | A signature cut across two packets evaded detection | Per-flow tail carried between segments |
+| Log handlers added on every engine start | Duplicate log lines | Add handlers only once |
+
 ---
 
+<a id="limitations"></a>
 ## ⚠️ Known Limitations
 
 WireWarden is a learning-grade IDS, not a replacement for Suricata or Zeek. Specifically:
