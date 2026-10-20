@@ -111,12 +111,12 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 | Engine | Time | Throughput | vs. naive |
 | :--- | :--- | :--- | :--- |
-| Python loop (lowercase + `sig in payload`) | `0.345 s` | `289,890 pkt/s` | 1.00x |
-| Python regex (one compiled alternation, `IGNORECASE`) | `0.497 s` | `201,146 pkt/s` | 0.69x |
-| **C, per-call via `ctypes` (what the live pipeline does)** | `0.101 s` | `987,933 pkt/s` | **3.41x** |
-| **C, batch (one FFI call for all packets)** | `0.042 s` | `2,368,105 pkt/s` | **8.17x** |
+| Python loop (lowercase + `sig in payload`) | `0.526 s` | `190,179 pkt/s` | 1.00x |
+| Python regex (one compiled alternation, `IGNORECASE`) | `0.546 s` | `183,100 pkt/s` | 0.96x |
+| **C, per-call via `ctypes` (what the live pipeline does)** | `0.095 s` | `1,055,043 pkt/s` | **5.55x** |
+| **C, batch (one FFI call for all packets)** | `0.024 s` | `4,142,193 pkt/s` | **21.78x** |
 
-*Sample run on a Linux x86-64 sandbox; numbers vary by machine — re-run on yours.*
+*Representative run on Windows, Python 3.13. Across four runs the C engine was stable (per-call 0.09–0.11 s) while the pure-Python baseline varied (0.50–0.68 s), so the speedup ranged ≈4.7–7.3x per call and ≈19.5–27.4x in batch. Re-run `benchmark_dpi.py` on your machine.*
 
 > **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the honest estimate for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
 
@@ -178,11 +178,11 @@ WireWarden/
 | 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | ✅ | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
 | 🧬 **DNS Security** | DNS Tunneling Detection | ✅ | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
 | ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | ✅ | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
-| 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈3.4x (per-call) / ≈8x (batch) vs. naive Python |
+| 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
 | ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, a shared `threading.Lock`, monotonic-time windows, and a dedicated GC thread. | Bounded queue, backpressure with counted drops |
 | 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
-| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 40 pytest tests (detection, native engine, firewall), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
+| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 44 pytest tests (detection, native engine, firewall for iptables and netsh), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
 
 ---
 
@@ -324,11 +324,12 @@ python test_attack.py <TARGET_IP>
 ```bash
 pip install -r requirements-dev.txt
 make -C c_src
-python -m pytest tests -v        # 40 tests: detection logic, DPI engines, firewall manager
+python -m pytest tests -v        # 44 tests: detection logic, DPI engines, firewall manager (iptables + netsh)
 make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
 - **Regression tests** pin every defect found during the project's own audit: SYN-ACK counted as a flood; outbound traffic counted as an attack; DNS responses blamed on the resolver; firewall rules that never expired; port-based DPI bypass; case-sensitive signatures; split-segment evasion; duplicate log handlers. Each test was verified to fail when its bug is reintroduced.
+- **Firewall tests** verify the exact `iptables` and `netsh` commands that get built, that add and delete use the same rule name, and that a failed command is never recorded as applied. They use an injected command runner, so they prove command construction, not the OS's reaction — that needs a manual run with admin rights.
 - **Fuzzing** allocates every buffer at its exact size, so an out-of-bounds read is an ASan failure. It covers truncated and upper-cased signatures placed flush against the end of the buffer.
 - **CI** (`.github/workflows/ci.yml`) builds the C library with `-Wall -Wextra -Werror`, runs pytest on Python 3.10 and 3.12, and runs the ASan/UBSan fuzzer.
 - **`test_attack.py`** is a live simulator (synthetic traffic only) that exercises the real sniff path and the Grafana dashboards, including a SYN-ACK **negative control** that must not alert.
