@@ -4,8 +4,6 @@
   A full end-to-end real-time <strong>Network Intrusion Detection & Prevention System (NIDS/NIPS)</strong>.
   <br>
   Combines a multi-threaded Python (Scapy) capture and analysis engine with a dual-layer DPI pipeline — an <strong>Aho-Corasick automaton</strong> for cleartext-credential patterns and a <strong>native C library</strong> (bounds-checked, called live via <code>ctypes</code>) for injection-pattern signatures — plus sliding-window anomaly detection, time-limited OS-firewall Active Defense, and a fully code-managed monitoring stack (<strong>Dashboard as Code</strong>) on <strong>Docker (Grafana + Loki + Promtail)</strong>.
-  <br>
-  <sub>Unit-tested (pytest), memory-fuzzed (ASan + UBSan) and CI-gated. Limitations are documented below.</sub>
 </p>
 
 <p align="center">
@@ -15,9 +13,6 @@
   <img src="https://img.shields.io/badge/Library-Scapy-red" alt="Scapy Badge">
   <img src="https://img.shields.io/badge/Stack-Docker_Compose-2496ED?logo=docker" alt="Docker Badge">
   <img src="https://img.shields.io/badge/Monitoring-Grafana-F46800?logo=grafana" alt="Grafana Badge">
-  <img src="https://img.shields.io/badge/Logs-Loki_%26_Promtail-orange" alt="Loki Badge">
-  <img src="https://img.shields.io/badge/Security-DPI_%26_NIDS-brightgreen" alt="NIDS Badge">
-  <img src="https://img.shields.io/badge/IaC-Dashboards_as_Code-blueviolet" alt="IaC Badge">
   <img src="https://img.shields.io/badge/Tests-pytest_%2B_ASan%2FUBSan_fuzz-success" alt="Tests Badge">
 </p>
 
@@ -27,7 +22,6 @@
   <a href="#features">Features</a> ·
   <a href="#dpi-engines">DPI</a> ·
   <a href="#performance">Resilience</a> ·
-  <a href="#technologies">Technologies</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#testing">Testing</a> ·
   <a href="#audit">Audit</a> ·
@@ -54,8 +48,6 @@
 
 **WireWarden** monitors, analyzes, and responds to network security events across OSI layers 3, 4, and 7.
 The architecture is a continuous Producer-Consumer pipeline that separates low-level packet capture, real-time threat analysis, and structured observability shipping.
-
-> **Architecture Highlight:** WireWarden runs a **dual-layer DPI pipeline**: an Aho-Corasick automaton for cleartext-credential keywords, and a native C library (`ctypes`) for injection signatures. Payloads are selected **by content** — ciphertext (TLS/SSH) is skipped by a printable-ASCII heuristic, not by port — so plaintext attacks on any port are still inspected.
 
 ```mermaid
 flowchart LR
@@ -110,17 +102,30 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 <a id="features"></a>
 ## 🚀 Core Features
 
-| Domain | Feature | Status | Description | Performance Indicator |
-| :--- | :--- | :---: | :--- | :--- |
-| 📡 **Network** | Real-time L3-L7 Sniffing | ✅ | Real-time capture and analysis of IP, TCP, UDP, and DNS traffic while keeping memory bounded (`store=0`, bounded queue). | Bounded memory, O(1) enqueue, counted drops |
-| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | ✅ | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
-| 🧬 **DNS Security** | DNS Tunneling Detection | ✅ | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
-| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | ✅ | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
-| 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
-| ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, a shared `threading.Lock`, monotonic-time windows, and a dedicated GC thread. | Bounded queue, backpressure with counted drops |
-| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
-| 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
-| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 46 pytest tests (detection, native engine, firewall for iptables and netsh, lab mode), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
+| Domain | Feature | Description | Performance Indicator |
+| :--- | :--- | :--- | :--- |
+| 📡 **Network** | Real-time L3-L7 Sniffing | Real-time capture and analysis of IP, TCP, UDP, and DNS traffic while keeping memory bounded (`store=0`, bounded queue). | Bounded memory, O(1) enqueue, counted drops |
+| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
+| 🧬 **DNS Security** | DNS Tunneling Detection | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
+| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
+| 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
+| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
+| 📝 **Logging** | Structured JSON Dual-Stream | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
+
+<a id="entropy"></a>
+### 🧬 Algorithmic Detection: Shannon Entropy for DNS Tunneling
+
+WireWarden identifies covert communication and data exfiltration over DNS by measuring the randomness (entropy) of the leftmost label of each DNS **query**.
+
+Ordinary domain names follow predictable natural-language patterns, whereas encoded data streams (e.g. Base64/Hex DNS tunneling) produce much higher entropy.
+
+- **Mathematical Model:**
+  Shannon Entropy $H(X)$ over the character distribution of the label:
+  $$H(X) = -\sum_{i=1}^{n} P(x_i) \log_2 P(x_i)$$
+- **Detection Rule:** a query is flagged when the label's $H(X) > 4.3$ **or** its length exceeds 45 characters.
+- **Why both conditions:** entropy of an $L$-character label cannot exceed $\log_2 L$ bits, so $H > 4.3$ is only reachable for labels of about 20+ characters. Short labels can't trigger it, which keeps ordinary hostnames quiet; the length rule catches very long labels regardless of their character mix.
+
+---
 
 ---
 
@@ -129,13 +134,12 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 
 WireWarden runs **two DPI engines together** in the live pipeline (`main.py`), each covering a different signature class, plus a standalone script that measures the C engine's throughput in isolation:
 
-| | **Live: Aho-Corasick (`KeywordEngine`)** | **Live: Native C (`NativeSignatureEngine`)** | **Standalone: `benchmark_dpi.py`** |
-| :--- | :--- | :--- | :--- |
-| Technology | `pyahocorasick` automaton, substring fallback if unavailable | Native C via `ctypes`, loaded once in `NetworkGuardian.__init__` | Same `libdpi` shared library, loaded independently |
-| Where it runs | `NetworkGuardian._check_dpi`, on every plaintext-looking payload | `NetworkGuardian._check_dpi`, on every plaintext-looking payload | Standalone script only — not imported by `main.py` |
-| Signature set | `password=`, `passwd=`, `pwd=`, `authorization: basic`, `api_key=`, `apikey=`, `select * from` | 14 case-insensitive signatures: SQLi, XSS, path traversal, command injection, sensitive files (defined once in `c_src/dpi.c`, read back by Python) | Same as the live C engine |
-| Purpose | Cleartext credential / query leak alerting | Injection-pattern alerting | Measuring C vs. pure-Python throughput |
-| Required? | Recommended (`pip install pyahocorasick`) | Optional — compile with `make -C c_src`; without it WireWarden runs on keyword DPI only | N/A — dev/benchmark tool |
+| | **Live: Aho-Corasick (`KeywordEngine`)** | **Live: Native C (`NativeSignatureEngine`)** |
+| :--- | :--- | :--- |
+| Technology | `pyahocorasick` automaton, substring fallback if unavailable | Native C via `ctypes`, loaded once in `NetworkGuardian.__init__` |
+| Signature set | `password=`, `passwd=`, `pwd=`, `authorization: basic`, `api_key=`, `apikey=`, `select * from` | 14 case-insensitive signatures: SQLi, XSS, path traversal, command injection, sensitive files (defined once in `c_src/dpi.c`, read back by Python) |
+| Purpose | Cleartext credential / query leak alerting | Injection-pattern alerting |
+| Required? | Recommended (`pip install pyahocorasick`) | Optional — compile with `make -C c_src`; without it WireWarden runs on keyword DPI only |
 
 Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` → `../`), and joined with a short per-flow tail so a signature split across two consecutive TCP segments is still caught.
 
@@ -158,15 +162,6 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 > **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the honest estimate for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
 
-> **Run Benchmark Locally:**
-> ```bash
-> # Linux / macOS
-> make -C c_src
-> # Windows (GCC) — requires MinGW/MSYS2 installed
-> gcc -shared -O3 -o libdpi.dll c_src/dpi.c
->
-> python benchmark_dpi.py
-> ```
 
 ---
 
@@ -177,37 +172,8 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 - **Concurrency Model (honest)** — Workers are threads, so under CPython's GIL the pure-Python analysis does **not** run in parallel. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores would require multiprocessing.
 - **Thread Safety via a Shared Lock** — Shared state (`syn_history`, `port_history`, `blacklist`) is protected by a single `threading.Lock` for atomic updates. All time windows use `time.monotonic()`, so wall-clock changes (NTP, DST) cannot corrupt them.
 - **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
+- **Safe Defaults for the Observability Stack** — Loki and Grafana are bound to `127.0.0.1`, the Grafana image version is pinned, and the admin password is mandatory (`docker compose` refuses to start without it).
 - **Deterministic Resource Cleanup (Garbage Collector)** — Dormant IP records, expired blacklist entries and stale flow tails are purged every 30 seconds by a background thread, keeping memory steady under sustained traffic.
-
----
-
-<a id="technologies"></a>
-## 🛠️ Technologies & Architectural Highlights
-
-- **Python & Scapy** — Raw-socket-level packet capture, protocol parsing, and deep payload-level inspection (DPI).
-- **Aho-Corasick DPI (live)** — Multi-pattern automaton (`pyahocorasick`) in `main.py` for real-time matching of cleartext-credential patterns, with a substring fallback when the library is unavailable.
-- **Native C Library (ctypes, live)** — Memory-bounds-checked, single-pass, case-insensitive C scanner loaded via `ctypes` in `NetworkGuardian.__init__` and called per payload. Its signature table is the single source of truth (Python reads names back through `signature_count()` / `signature_name()`). Requires `make -C c_src`; WireWarden degrades gracefully to keyword DPI if the library isn't built.
-- **Producer-Consumer Architecture** — Capture and analysis are separated by `queue.Queue(maxsize=20000)`; when full, packets are dropped and counted instead of growing memory.
-- **Thread-Safety & Active Defense** — Blacklist/whitelist and window state guarded by `threading.Lock`, integrated with background OS firewall rule injection and automatic removal (`netsh` / `iptables`).
-- **Background Garbage Collector** — A dedicated thread cleans stale sliding-window history, expired blacklist entries and idle flow tails every 30 seconds, keeping memory bounded for dormant IPs.
-- **Promtail & Grafana Loki** — Structured JSON logs shipped from the local logs directory and indexed in Loki.
-- **Dashboards as Code (IaC)** — The "WireWarden Security Overview" dashboard is version-controlled under `grafana/dashboards/` and auto-loaded into Grafana on container startup.
-- **Docker Compose Stack** — One-command deployment of the observability stack (Loki and Grafana bound to `127.0.0.1`, Grafana version pinned, admin password required).
-
----
-
-<a id="entropy"></a>
-### 🧬 Algorithmic Detection: Shannon Entropy for DNS Tunneling
-
-WireWarden identifies covert communication and data exfiltration over DNS by measuring the randomness (entropy) of the leftmost label of each DNS **query**.
-
-Ordinary domain names follow predictable natural-language patterns, whereas encoded data streams (e.g. Base64/Hex DNS tunneling) produce much higher entropy.
-
-- **Mathematical Model:**
-  Shannon Entropy $H(X)$ over the character distribution of the label:
-  $$H(X) = -\sum_{i=1}^{n} P(x_i) \log_2 P(x_i)$$
-- **Detection Rule:** a query is flagged when the label's $H(X) > 4.3$ **or** its length exceeds 45 characters.
-- **Why both conditions:** entropy of an $L$-character label cannot exceed $\log_2 L$ bits, so $H > 4.3$ is only reachable for labels of about 20+ characters. Short labels can't trigger it, which keeps ordinary hostnames quiet; the length rule catches very long labels regardless of their character mix.
 
 ---
 
