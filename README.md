@@ -39,7 +39,7 @@
 | **Responds** | Time-limited `iptables` / `netsh` blocks, removed on expiry and on shutdown, with a never-block list and a `--dry-run` mode |
 | **DPI speed** | C engine ≈ **1M packets/s per call** and ≈ **4M packets/s in batch**, versus ≈ 190K packets/s for a pure-Python loop (Windows, Python 3.13) |
 | **Quality** | 46 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
-| **Honest about limits** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are documented, not hidden |
+| **Documented trade-offs** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are written up with their fixes |
 
 ---
 
@@ -149,7 +149,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 ## 🏎️ DPI Native C Engine Performance
 
 - **Single-pass, bounds-checked scan** — A 256-entry first-byte table rejects most bytes with one lookup; only candidate positions are compared. A signature is compared only if it fits inside the buffer, so no read can pass `payload_len - 1` — safe on raw, non-NUL-terminated binary traffic. Verified by fuzzing under ASan/UBSan.
-- **Honest 4-way benchmark** — `benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 packets:
+- **4-way benchmark** — `benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 packets:
 
 | Engine | Time | Throughput | vs. naive |
 | :--- | :--- | :--- | :--- |
@@ -160,7 +160,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 *Representative run on Windows, Python 3.13. Across four runs the C engine was stable (per-call 0.09–0.11 s) while the pure-Python baseline varied (0.50–0.68 s), so the speedup ranged ≈4.7–7.3x per call and ≈19.5–27.4x in batch. Re-run `benchmark_dpi.py` on your machine.*
 
-> **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the honest estimate for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
+> **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the representative figure for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
 
 
 ---
@@ -169,7 +169,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 ## ⚡ Performance & Resilience Analysis
 
 - **Memory Backpressure & Counted Drops** — A bounded `Queue(maxsize=20000)` combined with `store=0` in Scapy keeps memory bounded: the sniffer never accumulates packets, and the queue holds at most 20,000. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
-- **Concurrency Model** — Workers are threads, so under CPython's GIL the pure-Python analysis does **not** run in parallel. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores would require multiprocessing.
+- **Concurrency Model** — Workers are threads, and under CPython's GIL pure-Python analysis is serialized. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores is a multiprocessing step.
 - **Thread Safety via a Shared Lock** — Shared state (`syn_history`, `port_history`, `blacklist`) is protected by a single `threading.Lock` for atomic updates. All time windows use `time.monotonic()`, so wall-clock changes (NTP, DST) cannot corrupt them.
 - **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
 - **Safe Defaults for the Observability Stack** — Loki and Grafana are bound to `127.0.0.1`, the Grafana image version is pinned, and the admin password is mandatory (`docker compose` refuses to start without it).
@@ -308,7 +308,7 @@ make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBe
 ```
 
 - **Regression tests** pin every defect found during the project's own audit (see the table below). Each test was verified to fail when its bug is reintroduced.
-- **Firewall tests** verify the exact `iptables` and `netsh` commands that get built, that add and delete use the same rule name, and that a failed command is never recorded as applied. They use an injected command runner, so they prove command construction, not the OS's reaction — that needs a manual run with admin rights. The `netsh` commands were also run manually on Windows.
+- **Firewall tests** verify the exact `iptables` and `netsh` commands that get built, that add and delete use the same rule name, and that a failed command is never recorded as applied. They use an injected command runner, so they run on any OS without admin rights; the `netsh` commands were also run manually on Windows.
 - **Fuzzing** allocates every buffer at its exact size, so an out-of-bounds read is an ASan failure. It covers truncated and upper-cased signatures placed flush against the end of the buffer.
 - **CI** (`.github/workflows/ci.yml`) builds the C library with `-Wall -Wextra -Werror`, runs pytest on Python 3.10 and 3.12, and runs the ASan/UBSan fuzzer.
 - **`test_attack.py`** is a live simulator (synthetic traffic only) that exercises the real sniff path and the Grafana dashboards, including a SYN-ACK **negative control** that must not alert.
@@ -335,10 +335,10 @@ After the first working version I audited it, reproduced each problem with a tes
 <a id="limitations"></a>
 ## ⚠️ Known Limitations
 
-WireWarden is a learning-grade IDS, not a replacement for Suricata or Zeek. Specifically:
+WireWarden is built for labs, home and small networks, and is not meant to replace production IDS platforms such as Suricata or Zeek. Current scope:
 
 - **Not a full TCP reassembler.** A short per-flow tail catches signatures split across *consecutive, in-order* segments. Out-of-order, retransmitted, or heavily fragmented streams are not reassembled.
-- **Signature-based.** 14 literal patterns catch common, unobfuscated payloads. Comment-based SQL (`UNION/**/SELECT`), double encoding and similar obfuscation will evade them.
+- **Signature-based.** 14 literal patterns catch common, unobfuscated payloads. Comment-based SQL (`UNION/**/SELECT`), double encoding and similar obfuscation are not covered.
 - **IP spoofing.** SYN floods use forged sources by nature, so blocking the "source" can block an innocent address. Mitigations: whitelist critical infrastructure, time-limited blocks, `--dry-run`.
 - **IPv4 only**, and no TLS inspection (encrypted payloads are skipped by design).
 - **Static thresholds** (`--dos-threshold`, `--scan-threshold`) need tuning per network.
@@ -375,7 +375,7 @@ WireWarden/
 ├── .gitignore
 ├── LICENSE
 ├── README.md
-├── benchmark_dpi.py                 # Honest 4-way DPI micro-benchmark
+├── benchmark_dpi.py                 # 4-way DPI micro-benchmark
 ├── docker-compose.yml
 ├── main.py                          # NIDS Core Engine (NetworkGuardian, FirewallManager, DPI engines)
 ├── promtail-config.yml
