@@ -24,15 +24,15 @@
 <p align="center">
   <a href="#overview">Overview</a> ·
   <a href="#dashboard">Dashboard</a> ·
-  <a href="#performance">Performance</a> ·
-  <a href="#dpi-engines">DPI</a> ·
-  <a href="#structure">Structure</a> ·
   <a href="#features">Features</a> ·
+  <a href="#dpi-engines">DPI</a> ·
+  <a href="#performance">Resilience</a> ·
   <a href="#technologies">Technologies</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#testing">Testing</a> ·
   <a href="#audit">Audit</a> ·
-  <a href="#limitations">Limitations</a>
+  <a href="#limitations">Limitations</a> ·
+  <a href="#structure">Structure</a>
 </p>
 
 ---
@@ -107,14 +107,20 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 
 ---
 
-<a id="performance"></a>
-## ⚡ Performance & Resilience Analysis
+<a id="features"></a>
+## 🚀 Core Features
 
-- **Memory Backpressure & Counted Drops** — A bounded `Queue(maxsize=20000)` combined with `store=0` in Scapy keeps memory bounded: the sniffer never accumulates packets, and the queue holds at most 20,000. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
-- **Concurrency Model (honest)** — Workers are threads, so under CPython's GIL the pure-Python analysis does **not** run in parallel. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores would require multiprocessing.
-- **Thread Safety via a Shared Lock** — Shared state (`syn_history`, `port_history`, `blacklist`) is protected by a single `threading.Lock` for atomic updates. All time windows use `time.monotonic()`, so wall-clock changes (NTP, DST) cannot corrupt them.
-- **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
-- **Deterministic Resource Cleanup (Garbage Collector)** — Dormant IP records, expired blacklist entries and stale flow tails are purged every 30 seconds by a background thread, keeping memory steady under sustained traffic.
+| Domain | Feature | Status | Description | Performance Indicator |
+| :--- | :--- | :---: | :--- | :--- |
+| 📡 **Network** | Real-time L3-L7 Sniffing | ✅ | Real-time capture and analysis of IP, TCP, UDP, and DNS traffic while keeping memory bounded (`store=0`, bounded queue). | Bounded memory, O(1) enqueue, counted drops |
+| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | ✅ | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
+| 🧬 **DNS Security** | DNS Tunneling Detection | ✅ | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
+| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | ✅ | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
+| 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
+| ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, a shared `threading.Lock`, monotonic-time windows, and a dedicated GC thread. | Bounded queue, backpressure with counted drops |
+| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
+| 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
+| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 46 pytest tests (detection, native engine, firewall for iptables and netsh, lab mode), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
 
 ---
 
@@ -164,59 +170,14 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 ---
 
-<a id="structure"></a>
-## 📂 Project Structure
+<a id="performance"></a>
+## ⚡ Performance & Resilience Analysis
 
-```text
-WireWarden/
-├── assets/                          # Static Documentation Assets (Dashboard Screenshots)
-│   ├── dashboard_overview.png
-│   ├── dashboard_threat_detection.png
-│   └── dashboard_analytics.png
-├── c_src/                           # Low-Level Native C Extensions
-│   ├── dpi.c                        # Native C DPI Engine (single-pass, case-insensitive, bounds-checked)
-│   ├── fuzz_dpi.c                   # ASan/UBSan fuzz harness
-│   └── Makefile                     # Build setup + `make fuzz`
-├── grafana/
-│   ├── dashboards/                  # Standard JSON Dashboard (Git Version-Controlled)
-│   │   └── dashboard-WireWarden Security Overview.json
-│   └── provisioning/                # Grafana Automated Provisioning Configs
-│       ├── dashboards/dashboards.yml
-│       └── datasources/datasources.yml
-├── tests/                           # pytest: detection logic, native engine, firewall manager
-│   ├── conftest.py
-│   ├── test_detection.py
-│   └── test_dpi_native.py
-├── .github/workflows/ci.yml         # Build (-Werror) + pytest + ASan/UBSan fuzz
-├── logs/                            # Runtime Log Directory (Ignored by Git, not tracked)
-├── .env.example
-├── .gitignore
-├── LICENSE
-├── README.md
-├── benchmark_dpi.py                 # Honest 4-way DPI micro-benchmark
-├── docker-compose.yml
-├── main.py                          # NIDS Core Engine (NetworkGuardian, FirewallManager, DPI engines)
-├── promtail-config.yml
-├── requirements.txt / requirements-dev.txt
-└── test_attack.py                   # Live Traffic Simulator
-```
-
----
-
-<a id="features"></a>
-## 🚀 Core Features
-
-| Domain | Feature | Status | Description | Performance Indicator |
-| :--- | :--- | :---: | :--- | :--- |
-| 📡 **Network** | Real-time L3-L7 Sniffing | ✅ | Real-time capture and analysis of IP, TCP, UDP, and DNS traffic while keeping memory bounded (`store=0`, bounded queue). | Bounded memory, O(1) enqueue, counted drops |
-| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | ✅ | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
-| 🧬 **DNS Security** | DNS Tunneling Detection | ✅ | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
-| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | ✅ | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
-| 🔍 **DPI Engine** | Deep Packet Inspection | ✅ | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
-| ⚙️ **Architecture** | Producer-Consumer & Thread-Safety | ✅ | Bounded `Queue`, a shared `threading.Lock`, monotonic-time windows, and a dedicated GC thread. | Bounded queue, backpressure with counted drops |
-| 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | ✅ | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
-| 📝 **Logging** | Structured JSON Dual-Stream | ✅ | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
-| 🧪 **Testing** | pytest + Fuzzing + Simulator | ✅ | 46 pytest tests (detection, native engine, firewall for iptables and netsh, lab mode), C engine fuzzed under ASan/UBSan, and `test_attack.py` for live end-to-end validation (including a SYN-ACK negative control). | CI-gated |
+- **Memory Backpressure & Counted Drops** — A bounded `Queue(maxsize=20000)` combined with `store=0` in Scapy keeps memory bounded: the sniffer never accumulates packets, and the queue holds at most 20,000. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
+- **Concurrency Model (honest)** — Workers are threads, so under CPython's GIL the pure-Python analysis does **not** run in parallel. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores would require multiprocessing.
+- **Thread Safety via a Shared Lock** — Shared state (`syn_history`, `port_history`, `blacklist`) is protected by a single `threading.Lock` for atomic updates. All time windows use `time.monotonic()`, so wall-clock changes (NTP, DST) cannot corrupt them.
+- **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
+- **Deterministic Resource Cleanup (Garbage Collector)** — Dormant IP records, expired blacklist entries and stale flow tails are purged every 30 seconds by a background thread, keeping memory steady under sustained traffic.
 
 ---
 
@@ -261,25 +222,6 @@ Ordinary domain names follow predictable natural-language patterns, whereas enco
 - **Administrator / Root Privileges** — Required to capture raw sockets via Scapy and to inject OS firewall rules (or use the least-privilege `setcap` option below on Linux for capture).
 - **`tcpdump` or `libpcap` (Linux)** — Scapy needs it to compile the `ip` capture filter. Without it `sniff()` fails on startup.
 - **Npcap (Windows only)** — Required for Scapy to capture raw packets on Windows adapters.
-
----
-
-<a id="logs"></a>
-## 📝 JSON Log Structure (Structured Logging)
-
-```json
-{
-  "timestamp": "2026-10-20T10:30:15.123456+03:00",
-  "level": "WARNING",
-  "message": "[PORT SCAN DETECTED] Host 203.0.113.7 probed 61 unique ports",
-  "logger": "NetworkGuardian",
-  "src_ip": "203.0.113.7",
-  "event_type": "PORT_SCAN",
-  "details": "61 ports scanned"
-}
-```
-
-Event types: `PORT_SCAN`, `STEALTH_SCAN`, `DOS_ATTACK`, `DOS_ATTACK_WHITELISTED`, `DNS_TUNNELING`, `DNS_QUERY`, `DPI_ALERT`, `DPI_ALERT_NATIVE`, `FIREWALL_BLOCK`, `FIREWALL_UNBLOCK`, `FIREWALL_ERROR`, `FIREWALL_DRY_RUN`, `ENGINE_STATS`.
 
 ---
 
@@ -370,6 +312,25 @@ python test_attack.py 192.168.1.1               # router / other device
 
 ---
 
+<a id="logs"></a>
+## 📝 JSON Log Structure (Structured Logging)
+
+```json
+{
+  "timestamp": "2026-10-20T10:30:15.123456+03:00",
+  "level": "WARNING",
+  "message": "[PORT SCAN DETECTED] Host 203.0.113.7 probed 61 unique ports",
+  "logger": "NetworkGuardian",
+  "src_ip": "203.0.113.7",
+  "event_type": "PORT_SCAN",
+  "details": "61 ports scanned"
+}
+```
+
+Event types: `PORT_SCAN`, `STEALTH_SCAN`, `DOS_ATTACK`, `DOS_ATTACK_WHITELISTED`, `DNS_TUNNELING`, `DNS_QUERY`, `DPI_ALERT`, `DPI_ALERT_NATIVE`, `FIREWALL_BLOCK`, `FIREWALL_UNBLOCK`, `FIREWALL_ERROR`, `FIREWALL_DRY_RUN`, `ENGINE_STATS`.
+
+---
+
 <a id="testing"></a>
 ## 🧪 Testing & Quality Gates
 
@@ -416,6 +377,45 @@ WireWarden is a learning-grade IDS, not a replacement for Suricata or Zeek. Spec
 - **IPv4 only**, and no TLS inspection (encrypted payloads are skipped by design).
 - **Static thresholds** (`--dos-threshold`, `--scan-threshold`) need tuning per network.
 - **Direction needs local addresses.** If none can be discovered, all traffic is treated as inbound.
+
+---
+
+<a id="structure"></a>
+## 📂 Project Structure
+
+```text
+WireWarden/
+├── assets/                          # Static Documentation Assets (Dashboard Screenshots)
+│   ├── dashboard_overview.png
+│   ├── dashboard_threat_detection.png
+│   └── dashboard_analytics.png
+├── c_src/                           # Low-Level Native C Extensions
+│   ├── dpi.c                        # Native C DPI Engine (single-pass, case-insensitive, bounds-checked)
+│   ├── fuzz_dpi.c                   # ASan/UBSan fuzz harness
+│   └── Makefile                     # Build setup + `make fuzz`
+├── grafana/
+│   ├── dashboards/                  # Standard JSON Dashboard (Git Version-Controlled)
+│   │   └── dashboard-WireWarden Security Overview.json
+│   └── provisioning/                # Grafana Automated Provisioning Configs
+│       ├── dashboards/dashboards.yml
+│       └── datasources/datasources.yml
+├── tests/                           # pytest: detection logic, native engine, firewall manager
+│   ├── conftest.py
+│   ├── test_detection.py
+│   └── test_dpi_native.py
+├── .github/workflows/ci.yml         # Build (-Werror) + pytest + ASan/UBSan fuzz
+├── logs/                            # Runtime Log Directory (Ignored by Git, not tracked)
+├── .env.example
+├── .gitignore
+├── LICENSE
+├── README.md
+├── benchmark_dpi.py                 # Honest 4-way DPI micro-benchmark
+├── docker-compose.yml
+├── main.py                          # NIDS Core Engine (NetworkGuardian, FirewallManager, DPI engines)
+├── promtail-config.yml
+├── requirements.txt / requirements-dev.txt
+└── test_attack.py                   # Live Traffic Simulator
+```
 
 ---
 
