@@ -158,7 +158,7 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 | **C, per-call via `ctypes` (what the live pipeline does)** | `0.095 s` | `1,055,043 pkt/s` | **5.55x** |
 | **C, batch (one FFI call for all packets)** | `0.024 s` | `4,142,193 pkt/s` | **21.78x** |
 
-*Representative run on Windows, Python 3.13. Across four runs the C engine was stable (per-call 0.09–0.11 s) while the pure-Python baseline varied (0.50–0.68 s), so the speedup ranged ≈4.7–7.3x per call and ≈19.5–27.4x in batch. Re-run `benchmark_dpi.py` on your machine.*
+*Representative run on Windows, Python 3.13. Across nine runs the C engine was stable (0.09–0.11 s per call, 0.024–0.027 s in batch) while the pure-Python baseline varied (0.46–0.68 s), so the speedup ranged ≈4.5–7.3x per call (median ≈5.2x) and ≈17.8–27.4x in batch (median ≈19.6x). Re-run `benchmark_dpi.py` on your machine.*
 
 > **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the representative figure for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
 
