@@ -37,7 +37,7 @@
 | :--- | :--- |
 | **Detects** | SYN floods, port scans, stealth scans (NULL / FIN / XMAS), DNS tunneling, injection attempts (SQLi, XSS, path traversal, command injection) and cleartext credentials |
 | **Responds** | Time-limited `iptables` / `netsh` blocks, removed on expiry and on shutdown, with a never-block list and a `--dry-run` mode |
-| **DPI speed** | C engine ≈ **1M packets/s per call** and ≈ **4M packets/s in batch**, versus ≈ 190K packets/s for a pure-Python loop (Windows, Python 3.13) |
+| **DPI engine** | Memory-safe C scanner at ≈ **1M packets/s** per call (≈5x a naive Python loop, on par with Aho-Corasick). Profiling shows Scapy dissection, not DPI, dominates per-packet time: see the [performance profile](#benchmark) |
 | **Quality** | 46 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
 | **Documented trade-offs** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are written up with their fixes |
 
@@ -108,7 +108,7 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 | 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
 | 🧬 **DNS Security** | DNS Tunneling Detection | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
 | ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
-| 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈5x (per-call) / ≈20x (batch) vs. naive Python |
+| 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈1M pkt/s per call (≈5x a naive Python loop, on par with Aho-Corasick) |
 | 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
 
@@ -124,8 +124,6 @@ Ordinary domain names follow predictable natural-language patterns, whereas enco
   $$H(X) = -\sum_{i=1}^{n} P(x_i) \log_2 P(x_i)$$
 - **Detection Rule:** a query is flagged when the label's $H(X) > 4.3$ **or** its length exceeds 45 characters.
 - **Why both conditions:** entropy of an $L$-character label cannot exceed $\log_2 L$ bits, so $H > 4.3$ is only reachable for labels of about 20+ characters. Short labels can't trigger it, which keeps ordinary hostnames quiet; the length rule catches very long labels regardless of their character mix.
-
----
 
 ---
 
@@ -146,10 +144,10 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 ---
 
 <a id="benchmark"></a>
-## 🏎️ DPI Native C Engine Performance
+## 🏎️ DPI Engine Performance & Profile
 
 - **Single-pass, bounds-checked scan** — A 256-entry first-byte table rejects most bytes with one lookup; only candidate positions are compared. A signature is compared only if it fits inside the buffer, so no read can pass `payload_len - 1` — safe on raw, non-NUL-terminated binary traffic. Verified by fuzzing under ASan/UBSan.
-- **4-way benchmark** — `benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 packets:
+- **Benchmark vs. a naive Python loop** — `python benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 identical short payloads:
 
 | Engine | Time | Throughput | vs. naive |
 | :--- | :--- | :--- | :--- |
@@ -160,8 +158,33 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 
 *Representative run on Windows, Python 3.13. Across nine runs the C engine was stable (0.09–0.11 s per call, 0.024–0.027 s in batch) while the pure-Python baseline varied (0.46–0.68 s), so the speedup ranged ≈4.5–7.3x per call (median ≈5.2x) and ≈17.8–27.4x in batch (median ≈19.6x). Re-run `benchmark_dpi.py` on your machine.*
 
-> **How to read it:** the batch row is the engine's ceiling with FFI overhead amortized. The live pipeline calls C once per packet, so **the per-call row is the representative figure for `main.py`**. Neither is end-to-end NIDS throughput, which also includes Scapy dissection and queueing.
+### Versus Aho-Corasick, on varied payloads
 
+A naive loop is the weakest Python baseline. The project's own alternative is `pyahocorasick`, so `python benchmark_dpi.py --sweep` compares against it on varied HTTP-like payloads from 64 to 1460 bytes (5% malicious), in packets per second:
+
+| Payload | Python loop | Python regex | Aho-Corasick | **C per call** | C batch | C per call vs. best Python |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 64 B | 253,336 | 250,998 | 647,811 | **519,176** | 1,264,935 | 0.80x |
+| 256 B | 168,609 | 64,658 | 282,227 | **274,539** | 335,111 | 0.97x |
+| 1024 B | 72,232 | 15,855 | 67,755 | **80,149** | 85,392 | 1.11x |
+| 1460 B | 53,231 | 10,632 | 53,911 | **57,462** | 56,438 | 1.07x |
+
+*Linux x86-64, Python 3.12, best of 5.* The C engine matches `pyahocorasick`: its value is a memory-safe, single-pass, case-insensitive scanner with no extra dependency, not a throughput lead over Aho-Corasick.
+
+### Where per-packet time goes
+
+`python benchmark_pipeline.py` measures one thread on synthetic HTTP-over-TCP frames:
+
+| Step | µs / packet | Share |
+| :--- | :--- | :--- |
+| Scapy dissects raw bytes into layers | 155 | **≈78%** |
+| `analyze_packet`: all detectors + DPI | 45 | ≈22% |
+| &nbsp;&nbsp;of which both DPI engines (+ URL decode, flow tail) | 4.9 | ≈2.4% |
+| &nbsp;&nbsp;of which the C signature scan alone | 1.9 | ≈1% |
+
+*Linux x86-64, Python 3.12. Two runs gave 78% and 82% for dissection.* End to end this is ≈5,000 packets/s per capture thread. Scapy's dissection dominates per-packet time and the whole DPI stage is about 2–3%, so a faster DPI engine cannot raise end-to-end throughput; the next optimization target is the packet parser. Above this rate the bounded queue drops packets, and every drop is counted.
+
+> **How to read the numbers:** the batch row is the C engine's ceiling with call overhead amortized. The live pipeline calls C once per packet, so the per-call rows are the representative figures for `main.py`. None of the micro-benchmarks is end-to-end throughput; `benchmark_pipeline.py` is.
 
 ---
 
@@ -341,6 +364,7 @@ WireWarden is built for labs, home and small networks, and is not meant to repla
 - **Signature-based.** 14 literal patterns catch common, unobfuscated payloads. Comment-based SQL (`UNION/**/SELECT`), double encoding and similar obfuscation are not covered.
 - **IP spoofing.** SYN floods use forged sources by nature, so blocking the "source" can block an innocent address. Mitigations: whitelist critical infrastructure, time-limited blocks, `--dry-run`.
 - **IPv4 only**, and no TLS inspection (encrypted payloads are skipped by design).
+- **Throughput is bound by packet dissection.** Scapy parsing costs ≈150 µs per packet in the profile above (≈5–7K packets/s per capture thread), which suits lab, home and small-office traffic. Above that rate packets are dropped and counted; high-rate links would need a lighter parser.
 - **Static thresholds** (`--dos-threshold`, `--scan-threshold`) need tuning per network.
 - **Direction needs local addresses.** If none can be discovered, all traffic is treated as inbound.
 
@@ -375,10 +399,12 @@ WireWarden/
 ├── .gitignore
 ├── LICENSE
 ├── README.md
-├── benchmark_dpi.py                 # 4-way DPI micro-benchmark
+├── benchmark_dpi.py                 # DPI micro-benchmark (5 engines, --sweep for payload sizes)
+├── benchmark_pipeline.py            # Per-packet cost breakdown (Scapy vs detectors vs DPI)
 ├── docker-compose.yml
 ├── main.py                          # NIDS Core Engine (NetworkGuardian, FirewallManager, DPI engines)
 ├── promtail-config.yml
+├── pytest.ini                       # Keeps the live simulator out of pytest
 ├── requirements.txt / requirements-dev.txt
 └── test_attack.py                   # Live Traffic Simulator
 ```
