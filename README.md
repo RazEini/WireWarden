@@ -147,16 +147,17 @@ Both engines apply to the **same normalized payload**: URL-decoded (`%2e%2e%2f` 
 ## 🏎️ DPI Engine Performance & Profile
 
 - **Single-pass, bounds-checked scan** — A 256-entry first-byte table rejects most bytes with one lookup; only candidate positions are compared. A signature is compared only if it fits inside the buffer, so no read can pass `payload_len - 1` — safe on raw, non-NUL-terminated binary traffic. Verified by fuzzing under ASan/UBSan.
-- **Benchmark vs. a naive Python loop** — `python benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 identical short payloads:
+- **Benchmark** — `python benchmark_dpi.py` asserts all engines agree, then times the same 14 signatures (all case-insensitive) on 100,000 identical short payloads:
 
 | Engine | Time | Throughput | vs. naive |
 | :--- | :--- | :--- | :--- |
-| Python loop (lowercase + `sig in payload`) | `0.526 s` | `190,179 pkt/s` | 1.00x |
-| Python regex (one compiled alternation, `IGNORECASE`) | `0.546 s` | `183,100 pkt/s` | 0.96x |
-| **C, per-call via `ctypes` (what the live pipeline does)** | `0.095 s` | `1,055,043 pkt/s` | **5.55x** |
-| **C, batch (one FFI call for all packets)** | `0.024 s` | `4,142,193 pkt/s` | **21.78x** |
+| Python loop (lowercase + `sig in payload`) | `0.439 s` | `227,769 pkt/s` | 1.00x |
+| Python regex (one compiled alternation, `IGNORECASE`) | `0.523 s` | `191,073 pkt/s` | 0.84x |
+| Aho-Corasick (`pyahocorasick`) | `0.104 s` | `964,561 pkt/s` | 4.23x |
+| **C, per-call via `ctypes` (what the live pipeline does)** | `0.093 s` | `1,074,722 pkt/s` | **4.72x** |
+| **C, batch (one FFI call for all packets)** | `0.024 s` | `4,117,039 pkt/s` | **18.08x** |
 
-*Representative run on Windows, Python 3.13. Across nine runs the C engine was stable (0.09–0.11 s per call, 0.024–0.027 s in batch) while the pure-Python baseline varied (0.46–0.68 s), so the speedup ranged ≈4.5–7.3x per call (median ≈5.2x) and ≈17.8–27.4x in batch (median ≈19.6x). Re-run `benchmark_dpi.py` on your machine.*
+*Representative run on Windows, Python 3.13. Across ten runs the C engine was stable (0.09–0.11 s per call, 0.024–0.027 s in batch) while the pure-Python baseline varied (0.44–0.68 s), so the speedup over the naive loop ranged ≈4.5–7.3x per call (median ≈5.1x) and ≈17.8–27.4x in batch (median ≈19.6x). Re-run `benchmark_dpi.py` on your machine.*
 
 ### Versus Aho-Corasick, on varied payloads
 
@@ -169,20 +170,20 @@ A naive loop is the weakest Python baseline. The project's own alternative is `p
 | 1024 B | 72,232 | 15,855 | 67,755 | **80,149** | 85,392 | 1.11x |
 | 1460 B | 53,231 | 10,632 | 53,911 | **57,462** | 56,438 | 1.07x |
 
-*Linux x86-64, Python 3.12, best of 5.* The C engine matches `pyahocorasick`: its value is a memory-safe, single-pass, case-insensitive scanner with no extra dependency, not a throughput lead over Aho-Corasick.
+*Linux x86-64, Python 3.12, best of 5 (run `--sweep` on your machine for your own numbers).* The C engine matches `pyahocorasick`: its value is a memory-safe, single-pass, case-insensitive scanner with no extra dependency, not a throughput lead over Aho-Corasick.
 
 ### Where per-packet time goes
 
-`python benchmark_pipeline.py` measures one thread on synthetic HTTP-over-TCP frames:
+`python benchmark_pipeline.py` measures one thread on synthetic HTTP-over-TCP frames (about 100-byte payloads):
 
 | Step | µs / packet | Share |
 | :--- | :--- | :--- |
-| Scapy dissects raw bytes into layers | 155 | **≈78%** |
-| `analyze_packet`: all detectors + DPI | 45 | ≈22% |
-| &nbsp;&nbsp;of which both DPI engines (+ URL decode, flow tail) | 4.9 | ≈2.4% |
-| &nbsp;&nbsp;of which the C signature scan alone | 1.9 | ≈1% |
+| Scapy dissects raw bytes into layers | 207 | **≈80%** |
+| `analyze_packet`: all detectors + DPI | 52 | ≈20% |
+| &nbsp;&nbsp;of which both DPI engines (+ URL decode, flow tail) | 3.5 | ≈1.4% |
+| &nbsp;&nbsp;of which the C signature scan alone | 1.1 | ≈0.4% |
 
-*Linux x86-64, Python 3.12. Two runs gave 78% and 82% for dissection.* End to end this is ≈5,000 packets/s per capture thread. Scapy's dissection dominates per-packet time and the whole DPI stage is about 2–3%, so a faster DPI engine cannot raise end-to-end throughput; the next optimization target is the packet parser. Above this rate the bounded queue drops packets, and every drop is counted.
+*Windows, Python 3.13. A Linux run (Python 3.12) gave the same picture: dissection 78–82%, all DPI about 2%.* End to end this is ≈3,900 packets/s per capture thread. Scapy's dissection dominates per-packet time and the whole DPI stage is only a few percent, so a faster DPI engine cannot raise end-to-end throughput; the next optimization target is the packet parser. Above this rate the bounded queue drops packets, and every drop is counted.
 
 > **How to read the numbers:** the batch row is the C engine's ceiling with call overhead amortized. The live pipeline calls C once per packet, so the per-call rows are the representative figures for `main.py`. None of the micro-benchmarks is end-to-end throughput; `benchmark_pipeline.py` is.
 
@@ -364,7 +365,7 @@ WireWarden is built for labs, home and small networks, and is not meant to repla
 - **Signature-based.** 14 literal patterns catch common, unobfuscated payloads. Comment-based SQL (`UNION/**/SELECT`), double encoding and similar obfuscation are not covered.
 - **IP spoofing.** SYN floods use forged sources by nature, so blocking the "source" can block an innocent address. Mitigations: whitelist critical infrastructure, time-limited blocks, `--dry-run`.
 - **IPv4 only**, and no TLS inspection (encrypted payloads are skipped by design).
-- **Throughput is bound by packet dissection.** Scapy parsing costs ≈150 µs per packet in the profile above (≈5–7K packets/s per capture thread), which suits lab, home and small-office traffic. Above that rate packets are dropped and counted; high-rate links would need a lighter parser.
+- **Throughput is bound by packet dissection.** Scapy parsing costs ≈150–200 µs per packet in the profile above (≈4–6K packets/s per capture thread), which suits lab, home and small-office traffic. Above that rate packets are dropped and counted; high-rate links would need a lighter parser.
 - **Static thresholds** (`--dos-threshold`, `--scan-threshold`) need tuning per network.
 - **Direction needs local addresses.** If none can be discovered, all traffic is treated as inbound.
 
