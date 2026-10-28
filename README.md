@@ -37,7 +37,7 @@
 | :--- | :--- |
 | **Detects** | SYN floods, port scans, stealth scans (NULL / FIN / XMAS), DNS tunneling, injection attempts (SQLi, XSS, path traversal, command injection) and cleartext credentials |
 | **Responds** | Time-limited `iptables` / `netsh` blocks, removed on expiry and on shutdown, with a never-block list and a `--dry-run` mode |
-| **DPI engine** | Memory-safe C scanner at ≈ **1M packets/s** per call (≈5x a naive Python loop, on par with Aho-Corasick). Profiling shows Scapy dissection, not DPI, dominates per-packet time: see the [performance profile](#benchmark) |
+| **DPI engine** | Memory-safe C scanner at ≈ **1M packets/s** per call (≈5x a naive Python loop; on par with Aho-Corasick on small payloads and up to ≈1.5x faster on larger ones). Profiling shows Scapy dissection, not DPI, dominates per-packet time: see the [performance profile](#benchmark) |
 | **Quality** | 46 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
 | **Documented trade-offs** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are written up with their fixes |
 
@@ -108,7 +108,7 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 | 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
 | 🧬 **DNS Security** | DNS Tunneling Detection | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
 | ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
-| 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈1M pkt/s per call (≈5x a naive Python loop, on par with Aho-Corasick) |
+| 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈1M pkt/s per call (≈5x a naive Python loop, up to ≈1.5x Aho-Corasick on larger payloads) |
 | 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
 
@@ -165,12 +165,12 @@ A naive loop is the weakest Python baseline. The project's own alternative is `p
 
 | Payload | Python loop | Python regex | Aho-Corasick | **C per call** | C batch | C per call vs. best Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 64 B | 253,336 | 250,998 | 647,811 | **519,176** | 1,264,935 | 0.80x |
-| 256 B | 168,609 | 64,658 | 282,227 | **274,539** | 335,111 | 0.97x |
-| 1024 B | 72,232 | 15,855 | 67,755 | **80,149** | 85,392 | 1.11x |
-| 1460 B | 53,231 | 10,632 | 53,911 | **57,462** | 56,438 | 1.07x |
+| 64 B | 191,752 | 231,568 | 988,303 | **945,533** | 2,278,086 | 0.96x |
+| 256 B | 142,598 | 53,744 | 324,261 | **430,695** | 610,188 | 1.33x |
+| 1024 B | 73,570 | 14,314 | 95,924 | **141,092** | 155,877 | 1.47x |
+| 1460 B | 56,649 | 10,327 | 68,026 | **106,626** | 114,994 | 1.57x |
 
-*Linux x86-64, Python 3.12, best of 5 (run `--sweep` on your machine for your own numbers).* The C engine matches `pyahocorasick`: its value is a memory-safe, single-pass, case-insensitive scanner with no extra dependency, not a throughput lead over Aho-Corasick.
+*Windows, Python 3.13, best of 5.* The C engine is on par with `pyahocorasick` on small payloads and 1.3–1.6x faster from 256 bytes up. A Linux run (Python 3.12) showed parity at all sizes (0.8–1.1x), so treat the gap as platform-dependent. Besides throughput, the C engine is a memory-safe, single-pass, case-insensitive scanner with no extra dependency.
 
 ### Where per-packet time goes
 
