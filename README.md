@@ -31,6 +31,13 @@
 
 ---
 
+<p align="center">
+  <img src="assets/wirewarden-demo.gif" alt="WireWarden demo: simulated attacks detected by the real engine" width="90%">
+  <br><em>Real engine output on simulated attack traffic (localhost, dry-run).</em>
+</p>
+
+---
+
 ## ✨ At a Glance
 
 | | |
