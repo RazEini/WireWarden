@@ -190,7 +190,7 @@ def test_flow_table_is_bounded(guardian):
 
 # ---- Engine health --------------------------------------------------------
 def test_queue_overflow_is_counted_not_silent(tmp_path, fw, libdpi):
-    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=fw, queue_size=5)
+    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=fw, queue_size=5, num_workers=1)
     for i in range(20):
         g._enqueue_packet(inbound("S", sport=2000 + i))
     assert g.dropped == 15 and g.captured == 20
@@ -335,3 +335,142 @@ def test_include_outbound_lab_mode_detects_attack_aimed_at_router(tmp_path, fw, 
     run_attack_against_router(g)
     assert "DOS_ATTACK" in types(g) and "PORT_SCAN" in types(g)
     assert fw.blocked == ["203.0.113.50"]
+
+# ---- Review findings: firewall removal must be retried, UDP replies are not probes,
+# ---- and one flow must always be handled by one worker --------------------------------
+import collections
+import threading
+
+from conftest import FakeFirewall
+from main import ShardedQueue, flow_key
+
+
+def test_failed_firewall_removal_keeps_the_rule_tracked(monkeypatch):
+    """Regression: unblock() forgot the rule BEFORE knowing the OS removed it."""
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    runner = scripted_runner([1, 0, 1, 0])  # -C absent, -I added, first -D fails, second -D works
+    fwm = FirewallManager(logging.getLogger("retry"), runner=runner)
+    fwm.block("203.0.113.9", blocking=True)
+    assert fwm.unblock("203.0.113.9") is False
+    assert fwm.has_rule("203.0.113.9")  # still installed, still tracked
+    assert fwm.unblock("203.0.113.9") is True
+    assert not fwm.has_rule("203.0.113.9")
+
+
+def test_unblock_all_reports_rules_it_could_not_remove(monkeypatch, caplog):
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    runner = scripted_runner([1, 0, 1])  # added, then removal fails
+    logger = logging.getLogger("leftovers")
+    logger.propagate = True
+    fwm = FirewallManager(logger, runner=runner)
+    fwm.block("203.0.113.9", blocking=True)
+    with caplog.at_level(logging.ERROR):
+        left = fwm.unblock_all()
+    assert left == ["203.0.113.9"]
+    assert "Remove manually" in caplog.text and "iptables -D INPUT -s 203.0.113.9" in caplog.text
+
+
+class FlakyFirewall(FakeFirewall):
+    """Removal fails the first `failures` times."""
+
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    def unblock(self, ip):
+        self.unblocked.append(ip)
+        if self.failures > 0:
+            self.failures -= 1
+            return False
+        self.rules.discard(ip)
+        return True
+
+
+def test_expired_block_is_retried_until_the_firewall_confirms(tmp_path, libdpi):
+    fw = FlakyFirewall(failures=2)
+    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=fw)
+    for i in range(g.DOS_THRESHOLD + 5):
+        g.analyze_packet(inbound("S", sport=1000 + i), now=100.0)
+    assert fw.has_rule(REMOTE)  # the DoS block was installed
+    g._cleanup_once(now=100.0 + g.BLOCK_DURATION + 1)   # attempt 1: fails
+    assert fw.has_rule(REMOTE) and REMOTE in g._unblock_retry
+    g._cleanup_once(now=100.0 + g.BLOCK_DURATION + 31)  # attempt 2: fails
+    assert fw.has_rule(REMOTE)
+    g._cleanup_once(now=100.0 + g.BLOCK_DURATION + 61)  # attempt 3: works
+    assert not fw.has_rule(REMOTE) and REMOTE not in g._unblock_retry
+
+
+def test_retry_never_removes_the_rule_of_a_source_that_is_blocked_again(tmp_path, libdpi):
+    fw = FlakyFirewall(failures=1)
+    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=fw)
+    fw.rules.add(REMOTE)
+    g._unblock_retry.add(REMOTE)
+    g.blacklist[REMOTE] = 10**12          # active block again
+    g._cleanup_once(now=1.0)
+    assert fw.has_rule(REMOTE) and REMOTE not in g._unblock_retry
+
+
+def dns_answer(sport):
+    return (IP(src="8.8.8.8", dst=LOCAL) / UDP(sport=53, dport=sport) /
+            DNS(qr=1, qd=DNSQR(qname="example.com")))
+
+
+def test_udp_answers_to_our_own_queries_are_not_a_port_scan(guardian):
+    """Regression: 60 legitimate DNS answers made the resolver look like a scanner."""
+    for i in range(60):
+        guardian.analyze_packet(IP(src=LOCAL, dst="8.8.8.8") / UDP(sport=40000 + i, dport=53) /
+                                DNS(rd=1, qd=DNSQR(qname="example.com")), now=10.0)  # a query this host started
+        guardian.analyze_packet(dns_answer(40000 + i), now=10.1)
+    assert "PORT_SCAN" not in types(guardian)
+
+
+def test_unsolicited_udp_sweep_is_still_a_port_scan(guardian):
+    for port in range(2000, 2060):
+        guardian.analyze_packet(IP(src=REMOTE, dst=LOCAL) / UDP(sport=5000, dport=port), now=10.0)
+    assert "PORT_SCAN" in types(guardian)
+
+
+def test_a_udp_reply_that_arrives_long_after_the_exchange_counts_as_unsolicited(guardian):
+    guardian.analyze_packet(IP(src=LOCAL, dst="8.8.8.8") / UDP(sport=40000, dport=53), now=10.0)
+    assert guardian._is_udp_reply("8.8.8.8", 53, 40000, now=11.0) is True
+    assert guardian._is_udp_reply("8.8.8.8", 53, 40000, now=11.0 + guardian.UDP_REPLY_TTL_SEC + 1) is False
+
+
+def test_an_ongoing_udp_exchange_stays_a_reply(guardian):
+    """A long-lived flow (QUIC, a video call) must not turn into a 'probe' after the TTL."""
+    guardian.analyze_packet(IP(src=LOCAL, dst="8.8.8.8") / UDP(sport=40000, dport=53), now=0.0)
+    assert guardian._is_udp_reply("8.8.8.8", 53, 40000, now=50.0)    # refreshes the entry
+    assert guardian._is_udp_reply("8.8.8.8", 53, 40000, now=100.0)   # 100 s after the query, 50 s after the refresh
+
+
+def test_both_directions_of_a_flow_use_the_same_key_and_worker():
+    fwd = IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=1234, dport=80)
+    rev = IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=80, dport=1234)
+    assert flow_key(fwd) == flow_key(rev)
+    q = ShardedQueue(8, 8000)
+    assert q.shard_for(fwd) == q.shard_for(rev)
+
+
+def test_different_flows_are_spread_across_workers():
+    q = ShardedQueue(4, 4000)
+    shards = {q.shard_for(IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=1000 + i, dport=80)) for i in range(200)}
+    assert len(shards) == 4
+
+
+def test_split_signatures_are_detected_with_many_workers(tmp_path, libdpi):
+    """Regression: with a shared queue, 2-8 workers missed 0.2-0.8% of split signatures."""
+    flows = 1500
+    g = NetworkGuardian(local_ips={LOCAL}, log_dir=str(tmp_path), firewall=FakeFirewall(),
+                        queue_size=10**6, num_workers=8)
+    g.logger.setLevel(logging.CRITICAL)
+    g.alerts = collections.deque(maxlen=10**6)
+    workers = [threading.Thread(target=g.packet_worker, args=(i,), daemon=True) for i in range(8)]
+    for w in workers:
+        w.start()
+    for i in range(flows):
+        src, sp = "203.0.113.%d" % (i % 250 + 1), 10000 + i
+        g.packet_queue.put(IP(src=src, dst=LOCAL) / TCP(sport=sp, dport=80, flags="PA") / Raw(load=b"GET /?q=1' UNI"))
+        g.packet_queue.put(IP(src=src, dst=LOCAL) / TCP(sport=sp, dport=80, flags="PA") / Raw(load=b"ON SELECT pw FROM users\r\n"))
+    g.packet_queue.join()
+    g.stop_event.set()
+    assert sum(1 for a in g.alerts if a["event_type"] == "DPI_ALERT_NATIVE") == flows

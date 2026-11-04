@@ -45,7 +45,7 @@
 | **Detects** | SYN floods, port scans, stealth scans (NULL / FIN / XMAS), DNS tunneling, injection attempts (SQLi, XSS, path traversal, command injection) and cleartext credentials |
 | **Responds** | Time-limited `iptables` / `netsh` blocks, removed on expiry and on shutdown, with a never-block list and a `--dry-run` mode |
 | **DPI engine** | Memory-safe C scanner at ≈ **1M packets/s** per call (≈5x a naive Python loop; on par with Aho-Corasick on small payloads and up to ≈1.5x faster on larger ones). Profiling shows Scapy dissection, not DPI, dominates per-packet time: see the [performance profile](#benchmark) |
-| **Quality** | 46 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
+| **Quality** | 57 pytest tests, C engine fuzzed under AddressSanitizer + UBSan, CI on every push |
 | **Documented trade-offs** | [Known limitations](#limitations) and the [bugs found by auditing my own code](#audit) are written up with their fixes |
 
 ---
@@ -61,9 +61,9 @@ flowchart LR
     NIC[📡 NIC] -->|Raw Packets| SnifferThread[🐍 Sniffer Thread<br>Scapy store=0]
 
     subgraph Engine [Python NIDS Core Engine]
-        SnifferThread -->|Non-blocking Put| Queue[📦 Bounded Queue<br>maxsize=20000]
+        SnifferThread -->|Non-blocking put by flow| Queue[📦 Per-flow queues<br>one per worker, 20,000 total]
         SnifferThread -. queue full .-> Drops[📉 dropped counter]
-        Queue -->|Get Packet| Worker[⚙️ Worker Pool]
+        Queue -->|Same flow, same worker| Worker[⚙️ Worker Pool]
 
         subgraph Detection [Detection & Defense]
             Worker -->|Inbound only| Anomaly[🛡️ DoS / Port-Scan<br>Sliding Windows]
@@ -112,9 +112,9 @@ Live view of the **WireWarden Security Overview** Grafana dashboard, provisioned
 | Domain | Feature | Description | Performance Indicator |
 | :--- | :--- | :--- | :--- |
 | 📡 **Network** | Real-time L3-L7 Sniffing | Real-time capture and analysis of IP, TCP, UDP, and DNS traffic while keeping memory bounded (`store=0`, bounded queue). | Bounded memory, O(1) enqueue, counted drops |
-| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
+| 🛡️ **Cyber Security** | Sliding-Window & Stealth Detection | Detects **DoS (SYN Flood — pure SYN only, replies excluded)**, port scans (per `(protocol, port)`; UDP answers to traffic this host started are not probes), and **Stealth Scans (NULL, FIN, XMAS)**. DoS/scan windows count **inbound** traffic only. | O(1) window updates |
 | 🧬 **DNS Security** | DNS Tunneling Detection | Shannon entropy and length of the leftmost label, on **queries only** (responses are skipped so the resolver is never blamed). | O(L) per label |
-| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
+| ⚡ **Active Defense** | Time-limited IP Isolation & OS Firewall | Adds `netsh` / `iptables` rules on a DoS verdict, **removes them on expiry and shutdown (a failed removal is retried)**, never blocks whitelisted/local/gateway addresses, supports `--dry-run`, and logs the real command result. | Non-blocking (background thread), O(1) blacklist check |
 | 🔍 **DPI Engine** | Deep Packet Inspection | Dual-layer L7 scanning: Aho-Corasick for cleartext-credential patterns, plus a native C library (`ctypes`) for 14 case-insensitive injection signatures. URL-decoding and cross-segment matching included. Falls back to Aho-Corasick alone if the C library isn't built. | O(N+M) keyword match; C path ≈1M pkt/s per call (≈5x a naive Python loop, up to ≈1.5x Aho-Corasick on larger payloads) |
 | 📊 **Observability & IaC** | Dashboard as Code (Grafana + Loki) | A single all-in-one "WireWarden Security Overview" dashboard in standard JSON, auto-loaded on container startup via provisioning files. | Instant provisioning on boot |
 | 📝 **Logging** | Structured JSON Dual-Stream | Colorized console output alongside structured JSON log writes (`logs/network_security.json`), tailored for Promtail. | Promtail-ready labels: level, event_type, src_ip |
@@ -199,10 +199,11 @@ A naive loop is the weakest Python baseline. The project's own alternative is `p
 <a id="performance"></a>
 ## ⚡ Performance & Resilience Analysis
 
-- **Memory Backpressure & Counted Drops** — A bounded `Queue(maxsize=20000)` combined with `store=0` in Scapy keeps memory bounded: the sniffer never accumulates packets, and the queue holds at most 20,000. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
+- **Memory Backpressure & Counted Drops** — Bounded queues (20,000 packets in total, split across the workers) combined with `store=0` in Scapy keep memory bounded: the sniffer never accumulates packets. When analysis falls behind, excess packets are dropped rather than risking Out-Of-Memory crashes — and every drop is **counted** and reported (`[STATS] captured=… dropped=…`), so loss is visible, not silent.
 - **Concurrency Model** — Workers are threads, and under CPython's GIL pure-Python analysis is serialized. Threads decouple capture from analysis and overlap work that releases the GIL (socket reads, the `ctypes` call into C). Scaling analysis across cores is a multiprocessing step.
+- **Per-Flow Worker Affinity** — Each worker has its own queue and a flow (both directions) always goes to the same one, so a worker sees a flow's segments in capture order. With a single shared queue, 2–8 workers missed 0.2–0.8% of signatures split across two segments; with per-flow queues all of them are found at any worker count.
 - **Thread Safety via a Shared Lock** — Shared state (`syn_history`, `port_history`, `blacklist`) is protected by a single `threading.Lock` for atomic updates. All time windows use `time.monotonic()`, so wall-clock changes (NTP, DST) cannot corrupt them.
-- **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
+- **Active Defense & OS Firewall Integration** — Dynamic OS firewall rules (`iptables` on Linux, `netsh advfirewall` on Windows) are applied on a DoS verdict in a background thread, so slow firewall commands don't stall the worker. Blocks are **time-limited**: the rule is removed when the block expires and on shutdown, and the log reports what the OS actually returned (applied / FAILED + stderr). A rule stays tracked until the OS confirms its removal: failed removals are retried every cleanup cycle, and anything still left at shutdown is reported with the exact command to run by hand. A never-block list (loopback, this host, default gateway, `--whitelist`) and a `--dry-run` mode guard against self-inflicted outages.
 - **Safe Defaults for the Observability Stack** — Loki and Grafana are bound to `127.0.0.1`, the Grafana image version is pinned, and the admin password is mandatory (`docker compose` refuses to start without it).
 - **Deterministic Resource Cleanup (Garbage Collector)** — Dormant IP records, expired blacklist entries and stale flow tails are purged every 30 seconds by a background thread, keeping memory steady under sustained traffic.
 
@@ -334,7 +335,7 @@ Event types: `PORT_SCAN`, `STEALTH_SCAN`, `DOS_ATTACK`, `DOS_ATTACK_WHITELISTED`
 ```bash
 pip install -r requirements-dev.txt
 make -C c_src
-python -m pytest tests -v        # 46 tests: detection logic, DPI engines, firewall manager (iptables + netsh), lab mode
+python -m pytest tests -v        # 57 tests: detection logic, DPI engines, firewall manager (iptables + netsh), lab mode
 make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
@@ -347,7 +348,7 @@ make -C c_src fuzz ITER=1000000  # C engine under AddressSanitizer + UndefinedBe
 <a id="audit"></a>
 ### 🐞 Bugs Found by Auditing My Own Code
 
-After the first working version I audited it, reproduced each problem with a test, and fixed it. Every row has a regression test.
+After the first working version I audited it, reproduced each problem with a test, and fixed it. Every row has a regression test. The last three rows came from a later independent review; I reproduced each one before fixing it.
 
 | Defect | Impact | Fix |
 | :--- | :--- | :--- |
@@ -360,6 +361,9 @@ After the first working version I audited it, reproduced each problem with a tes
 | Case-sensitive signatures | `union select` in lowercase evaded detection | ASCII case-insensitive matching in C |
 | No handling of split segments | A signature cut across two packets evaded detection | Per-flow tail carried between segments |
 | Log handlers added on every engine start | Duplicate log lines | Add handlers only once |
+| Firewall rule forgotten before the OS confirmed removal | A failed `iptables` / `netsh` delete left a permanent block that nothing tracked or retried | Keep the rule tracked until removal succeeds; retry every cycle; report leftovers with the manual command |
+| Every UDP packet counted as a scan probe | 60 legitimate DNS answers raised a PORT_SCAN alert against the resolver | Answers to traffic this host started are replies, not probes |
+| One shared queue for all workers | Two workers could process a flow's segments in swapped order and miss a split signature (0.2–0.8% with 2–8 workers) | Per-flow queues: a flow always goes to the same worker |
 
 ---
 
@@ -368,7 +372,7 @@ After the first working version I audited it, reproduced each problem with a tes
 
 WireWarden is built for labs, home and small networks, and is not meant to replace production IDS platforms such as Suricata or Zeek. Current scope:
 
-- **Not a full TCP reassembler.** A short per-flow tail catches signatures split across *consecutive, in-order* segments. Out-of-order, retransmitted, or heavily fragmented streams are not reassembled.
+- **Not a full TCP reassembler.** A short per-flow tail catches signatures split across *consecutive, in-order* segments (per-flow worker affinity keeps them in capture order). Segments that arrive out of order on the wire, retransmissions and heavy fragmentation are not reassembled.
 - **Signature-based.** 14 literal patterns catch common, unobfuscated payloads. Comment-based SQL (`UNION/**/SELECT`), double encoding and similar obfuscation are not covered.
 - **IP spoofing.** SYN floods use forged sources by nature, so blocking the "source" can block an innocent address. Mitigations: whitelist critical infrastructure, time-limited blocks, `--dry-run`.
 - **IPv4 only**, and no TLS inspection (encrypted payloads are skipped by design).

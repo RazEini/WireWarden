@@ -43,14 +43,22 @@ class FakeRunner:
 
 
 class FakeFirewall:
+    """Records calls and tracks which rules are 'installed'."""
+
     def __init__(self):
-        self.blocked, self.unblocked = [], []
+        self.blocked, self.unblocked, self.rules = [], [], set()
 
     def block(self, ip, blocking=False):
         self.blocked.append(ip)
+        self.rules.add(ip)
+
+    def has_rule(self, ip):
+        return ip in self.rules
 
     def unblock(self, ip):
         self.unblocked.append(ip)
+        self.rules.discard(ip)
+        return True
 
     def unblock_all(self):
         pass

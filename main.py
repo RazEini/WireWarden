@@ -200,25 +200,38 @@ class FirewallManager:
             return self._block_now(ip)
         threading.Thread(target=self._block_now, args=(ip,), daemon=True, name="FirewallBlock").start()
 
+    def has_rule(self, ip: str) -> bool:
+        with self._lock:
+            return ip in self.rules
+
     def unblock(self, ip: str) -> bool:
+        """Remove the rule. It stays tracked until the OS confirms removal, so a failed
+        removal can be retried instead of leaving a permanent block nobody remembers."""
         with self._lock:
             if ip not in self.rules:
                 return False
-            self.rules.discard(ip)
         _, delete = self._commands("unblock", ip)
         if delete is None:
             return False
         ok, err = self._run(delete)
-        level = logging.WARNING if ok else logging.ERROR
-        self.logger.log(level, f"[FIREWALL] rule {'removed' if ok else 'removal FAILED'} for {ip}" + ("" if ok else f": {err}"),
+        if ok:
+            with self._lock:
+                self.rules.discard(ip)
+        self.logger.log(logging.WARNING if ok else logging.ERROR,
+                        f"[FIREWALL] rule {'removed' if ok else 'removal FAILED (will retry)'} for {ip}" + ("" if ok else f": {err}"),
                         extra={"src_ip": ip, "event_type": "FIREWALL_UNBLOCK", "details": "removed" if ok else err})
         return ok
 
-    def unblock_all(self):
+    def unblock_all(self) -> list:
+        """Try to remove every tracked rule. Returns the IPs whose removal failed."""
         with self._lock:
             pending = list(self.rules)
-        for ip in pending:
-            self.unblock(ip)
+        left = [ip for ip in pending if not self.unblock(ip)]
+        if left:
+            manual = "; ".join(" ".join(self._commands("unblock", ip)[1] or []) for ip in left)
+            self.logger.error(f"[FIREWALL] could not remove {len(left)} rule(s) for {', '.join(left)}. Remove manually: {manual}",
+                              extra={"event_type": "FIREWALL_ERROR", "details": f"left behind: {', '.join(left)}"})
+        return left
 
 
 # ---------------------------------------------------------------------------
@@ -319,18 +332,58 @@ class KeywordEngine:
 # ---------------------------------------------------------------------------
 # Core engine
 # ---------------------------------------------------------------------------
+def flow_key(pkt) -> tuple:
+    """Direction-independent identity of a flow (both directions give the same key)."""
+    ip = pkt[IP]
+    if pkt.haslayer(TCP):
+        l4 = pkt[TCP]
+    elif pkt.haslayer(UDP):
+        l4 = pkt[UDP]
+    else:
+        return tuple(sorted((ip.src, ip.dst)))
+    return tuple(sorted(((ip.src, l4.sport), (ip.dst, l4.dport))))
+
+
+class ShardedQueue:
+    """One bounded queue per worker. A flow always maps to the same queue, so a single
+    worker sees all of that flow's packets in capture order. Without this, two workers can
+    process consecutive segments of one flow in swapped order and miss a split signature."""
+
+    def __init__(self, shards: int, maxsize: int):
+        self.shards = [Queue(maxsize=max(1, maxsize // shards)) for _ in range(shards)]
+
+    def shard_for(self, pkt) -> int:
+        return hash(flow_key(pkt)) % len(self.shards)
+
+    def put_nowait(self, pkt):
+        self.shards[self.shard_for(pkt)].put_nowait(pkt)
+
+    def put(self, pkt):
+        self.shards[self.shard_for(pkt)].put(pkt)
+
+    def qsize(self) -> int:
+        return sum(q.qsize() for q in self.shards)
+
+    def join(self):
+        for q in self.shards:
+            q.join()
+
+
 class NetworkGuardian:
     MAX_TRACKED_FLOWS = 10_000
     FLOW_TTL_SEC = 30
+    UDP_REPLY_TTL_SEC = 60
+    MAX_UDP_FLOWS = 10_000
     DNS_ENTROPY_THRESHOLD = 4.3
     DNS_MAX_LABEL_LEN = 45
 
     def __init__(self, dos_threshold=500, scan_threshold=50, time_window_sec=10,
                  cleanup_interval_sec=30, block_duration_sec=300, queue_size=20000,
                  whitelist=(), local_ips=None, dry_run=False, log_dir="logs", firewall=None,
-                 include_outbound=False):
+                 include_outbound=False, num_workers=4):
         self.logger = setup_logger(log_dir)
-        self.packet_queue = Queue(maxsize=queue_size)
+        self.num_workers = max(1, int(num_workers))
+        self.packet_queue = ShardedQueue(self.num_workers, queue_size)
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
 
@@ -349,6 +402,13 @@ class NetworkGuardian:
         # Per-flow tail so a signature split across two TCP segments is still seen.
         self._flow_tails = OrderedDict()
         self._tail_lock = threading.Lock()
+
+        # Outbound UDP this host started: inbound packets from those peers are replies, not probes.
+        self._udp_out = OrderedDict()
+        self._udp_lock = threading.Lock()
+
+        # Expired blocks whose firewall removal failed; retried on every cleanup cycle.
+        self._unblock_retry = set()
 
         # Observability of the engine itself
         self.captured = 0
@@ -404,6 +464,23 @@ class NetworkGuardian:
         while history_deque and (now - history_deque[0][0]) > self.TIME_WINDOW:
             history_deque.popleft()
 
+    # -- UDP reply tracking ------------------------------------------------
+    def _note_outbound_udp(self, remote_ip, remote_port, local_port, now):
+        with self._udp_lock:
+            self._udp_out[(remote_ip, remote_port, local_port)] = now
+            self._udp_out.move_to_end((remote_ip, remote_port, local_port))
+            while len(self._udp_out) > self.MAX_UDP_FLOWS:
+                self._udp_out.popitem(last=False)
+
+    def _is_udp_reply(self, src_ip, src_port, dst_port, now) -> bool:
+        key = (src_ip, src_port, dst_port)
+        with self._udp_lock:
+            ts = self._udp_out.get(key)
+            if ts is None or now - ts > self.UDP_REPLY_TTL_SEC:
+                return False
+            self._udp_out[key] = now  # a live exchange (e.g. QUIC) stays a reply
+            return True
+
     # -- capture side ------------------------------------------------------
     def _enqueue_packet(self, pkt):
         if not pkt.haslayer(IP):
@@ -429,13 +506,24 @@ class NetworkGuardian:
             for ip in expired:
                 del self.blacklist[ip]
 
-        for ip in expired:  # outside the lock: firewall calls are slow
-            self.firewall.unblock(ip)
+        has_rule = getattr(self.firewall, "has_rule", lambda _ip: False)
+        for ip in list(dict.fromkeys(expired + list(self._unblock_retry))):  # outside the lock: firewall calls are slow
+            if ip in self.blacklist:  # blocked again meanwhile: keep the rule
+                self._unblock_retry.discard(ip)
+                continue
+            if self.firewall.unblock(ip) or not has_rule(ip):
+                self._unblock_retry.discard(ip)
+            else:
+                self._unblock_retry.add(ip)
 
         with self._tail_lock:
             stale = [f for f, (ts, _) in self._flow_tails.items() if now - ts > self.FLOW_TTL_SEC]
             for f in stale:
                 del self._flow_tails[f]
+
+        with self._udp_lock:
+            for k in [k for k, ts in self._udp_out.items() if now - ts > self.UDP_REPLY_TTL_SEC]:
+                del self._udp_out[k]
 
         if self.dropped:
             self.logger.warning(
@@ -542,8 +630,13 @@ class NetworkGuardian:
         elif pkt.haslayer(UDP):
             udp = pkt[UDP]
             dst_port, proto = udp.dport, "udp"
-            is_probe = True
             flow = (src_ip, udp.sport, dst_ip, udp.dport)
+            if src_ip in self.local_ips:
+                self._note_outbound_udp(dst_ip, udp.dport, udp.sport, now)
+                is_probe = True
+            else:
+                # Answers to traffic this host started (DNS, QUIC, NTP...) are not scan probes.
+                is_probe = not self._is_udp_reply(src_ip, udp.sport, udp.dport, now)
 
         # 2. DoS and port-scan windows - INBOUND traffic only. Our own outbound
         #    connections and replies must never count as an attack.
@@ -589,10 +682,11 @@ class NetworkGuardian:
                 self._check_dpi(payload, src_ip, flow, now)
 
     # -- threads -----------------------------------------------------------
-    def packet_worker(self):
+    def packet_worker(self, shard: int = 0):
+        q = self.packet_queue.shards[shard]
         while not self.stop_event.is_set():
             try:
-                packet = self.packet_queue.get(timeout=0.5)
+                packet = q.get(timeout=0.5)
             except Empty:
                 continue
             try:
@@ -600,11 +694,15 @@ class NetworkGuardian:
             except Exception as e:
                 self.logger.error(f"[WORKER ERROR] {e}")
             finally:
-                self.packet_queue.task_done()
+                q.task_done()
 
-    def start(self, num_workers=4, iface=None):
+    def start(self, num_workers=None, iface=None):
         self.logger.info("WireWarden engine starting...")
-        workers = [threading.Thread(target=self.packet_worker, daemon=True, name=f"Worker-{i}")
+        if num_workers is not None and int(num_workers) != self.num_workers:
+            self.num_workers = max(1, int(num_workers))
+            self.packet_queue = ShardedQueue(self.num_workers, sum(q.maxsize for q in self.packet_queue.shards))
+        num_workers = self.num_workers
+        workers = [threading.Thread(target=self.packet_worker, args=(i,), daemon=True, name=f"Worker-{i}")
                    for i in range(num_workers)]
         cleanup = threading.Thread(target=self._cleanup_worker, daemon=True, name="CleanupGC")
         for t in workers + [cleanup]:
@@ -644,5 +742,5 @@ if __name__ == "__main__":
         dos_threshold=args.dos_threshold, scan_threshold=args.scan_threshold,
         block_duration_sec=args.block_seconds,
         whitelist=[w.strip() for w in args.whitelist.split(",") if w.strip()],
-        dry_run=args.dry_run, include_outbound=args.include_outbound)
-    guardian.start(num_workers=args.workers, iface=args.iface)
+        dry_run=args.dry_run, include_outbound=args.include_outbound, num_workers=args.workers)
+    guardian.start(iface=args.iface)
