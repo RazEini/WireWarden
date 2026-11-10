@@ -164,6 +164,11 @@ def main() -> None:
     print("🕵️  WireWarden Attack Simulator Initializing...")
     print(f"🎯 Target IP set to: {TARGET_IP}")
     print("⚠️  Safe mode active: Sending synthetic packets only.\n")
+    if len(sys.argv) == 1:
+        print("ℹ️  No target given, so this machine's own address is used. Packets a machine sends to itself usually")
+        print("   do not reach the capture interface. For a full demo either run the engine on loopback")
+        print("   (python main.py --iface lo --dry-run) and use 127.0.0.1, or target another device and add")
+        print("   --include-outbound to the engine. See the README section 'Running the simulator'.\n")
 
     try:
         test_dpi_signatures()

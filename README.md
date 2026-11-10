@@ -280,7 +280,7 @@ python main.py --whitelist 10.0.0.0/24
 | :--- | :--- | :--- |
 | `--dry-run` | off | Log what *would* be blocked; never run firewall commands |
 | `--whitelist A,B/CIDR` | – | Extra never-block addresses (this host, gateway and loopback are automatic) |
-| `--include-outbound` | off | **Lab mode:** also count traffic this host *sends*. Needed when `test_attack.py` targets another device such as your router (see below) |
+| `--include-outbound` | off | **Lab mode:** also count traffic this host *sends*. Needed when `test_attack.py` targets another device such as your router (see [Running the simulator](#simulator)) |
 | `--block-seconds` | 300 | How long a DoS source stays blocked |
 | `--dos-threshold` / `--scan-threshold` | 500 / 50 | Events per 10-second window |
 | `--workers` / `--iface` | 4 / default | Worker threads / interface to sniff |
@@ -288,10 +288,7 @@ python main.py --whitelist 10.0.0.0/24
 ### 7. Run Attack Simulator (in a separate terminal)
 
 ```bash
-# Automatically targets local active IP:
-python test_attack.py
-
-# Or target a specific IP address explicitly:
+# Target a specific address (see "Running the simulator" below for which one to choose):
 python test_attack.py <TARGET_IP>
 ```
 
@@ -301,12 +298,20 @@ python test_attack.py <TARGET_IP>
 
 DoS and port-scan windows count **inbound** traffic only, meaning packets whose destination is one of this machine's own addresses. Your own outbound traffic and replies must never look like an attack. DPI, stealth-scan and DNS-tunneling detection look at traffic in both directions.
 
-That matters for the simulator. `test_attack.py` run **without an argument** targets your own IP, so every detector fires, including the red DoS block. If you point it at **another device** (e.g. your router), those packets leave your machine, so the DoS and port-scan alerts are skipped on purpose. To demo against another device, add the lab flag:
+<a id="simulator"></a>
+### Running the simulator
 
-```bash
-python main.py --include-outbound --dry-run     # --dry-run: alerts only, no firewall rule
-python test_attack.py 192.168.1.1               # router / other device
-```
+The target you choose decides which alerts you see, because the engine only sees packets that cross the interface it captures on.
+
+| Setup | Commands | What you see |
+| :--- | :--- | :--- |
+| **Everything on this machine** (Linux) | `python main.py --iface lo --dry-run`<br>`python test_attack.py 127.0.0.1` | All detectors, including the DoS block. Loopback traffic is inbound by definition. |
+| **Another device on your network** (router, second PC; used on Windows) | `python main.py --include-outbound --dry-run`<br>`python test_attack.py <DEVICE_IP>` | All detectors. The packets leave your machine, so the lab flag is needed for the DoS and port-scan alerts. |
+| **Another device, without the lab flag** | `python main.py --dry-run`<br>`python test_attack.py <DEVICE_IP>` | DPI, stealth-scan and DNS alerts only. The DoS and port-scan windows ignore outbound traffic on purpose. |
+
+`--dry-run` keeps every run alert-only, with no firewall rule. Traffic that arrives from another computer is genuinely inbound, so a simulator run from a second machine against this host's address needs no lab flag.
+
+Running `python test_attack.py` **without an argument** targets this machine's own address. Packets a machine sends to itself usually never reach the capture interface, so the simulator prints a reminder to use one of the setups above.
 
 ---
 
